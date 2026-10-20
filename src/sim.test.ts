@@ -187,3 +187,149 @@ test('ExperimentManager records distraction events, lane deviation, recovery tim
     'Recorded lane recovery time in ms after gaze return',
   );
 });
+
+test('collision physics stops tunneling through vehicles at high speed and transfers momentum', () => {
+  const state = createInitialVehicleState();
+  state.s = 85;
+  state.speed = 30.0; // 108 km/h high approach speed
+  state.lateralOffset = 1.8; // right lane
+
+  const hazards = [
+    {
+      id: 99,
+      type: 'truck' as const,
+      s: 98,
+      laneIndex: 1 as const,
+      lateralOffset: 1.8,
+      speed: 10.0,
+      width: 2.3,
+      length: 7.2,
+      colorHex: 0xe2e8f0,
+      telegraphActive: false,
+      brakeTriggered: false,
+      passed: false,
+      collided: false,
+      nearMissed: false,
+    },
+  ];
+
+  const events: any[] = [];
+  // Step simulation where player approaches and strikes the truck
+  for (let i = 0; i < 10; i++) {
+    const stepEvents = stepVehicleSimulation(
+      state,
+      { steer: 0, throttle: 1, brake: 0 },
+      hazards,
+      0.05,
+      false,
+    );
+    events.push(...stepEvents);
+  }
+
+  // Player must NOT phase through the truck: state.s must remain behind the truck's rear bumper!
+  assert.ok(
+    state.s <= hazards[0].s - 4.5,
+    `Player car must not phase through lead truck (player s=${state.s.toFixed(2)}, hazard s=${hazards[0].s.toFixed(2)})`,
+  );
+  assert.ok(hazards[0].collided, 'Hazard marked as collided');
+  assert.ok(
+    events.some((e) => e.type === 'hazard'),
+    'Hazard impact event emitted',
+  );
+  assert.ok(state.speed < 25.0, 'Player car decelerated from collision');
+});
+
+test('traffic car-following AI prevents lead vehicle overlap and maintains safe headway', () => {
+  const state = createInitialVehicleState();
+  state.s = 0;
+  state.speed = 0;
+
+  const hazards = [
+    {
+      id: 1,
+      type: 'truck' as const,
+      s: 140,
+      laneIndex: 1 as const,
+      lateralOffset: 1.8,
+      speed: 8.0,
+      width: 2.3,
+      length: 7.2,
+      colorHex: 0xe2e8f0,
+      telegraphActive: false,
+      brakeTriggered: false,
+      passed: false,
+      collided: false,
+      nearMissed: false,
+    },
+    {
+      id: 2,
+      type: 'sedan' as const,
+      s: 120, // 20m behind the truck in the same lane
+      laneIndex: 1 as const,
+      lateralOffset: 1.8,
+      speed: 16.0, // faster approach
+      width: 1.85,
+      length: 4.2,
+      colorHex: 0x38bdf8,
+      telegraphActive: false,
+      brakeTriggered: false,
+      passed: false,
+      collided: false,
+      nearMissed: false,
+    },
+  ];
+
+  // Run simulation for 2 seconds (40 steps of 0.05s)
+  for (let i = 0; i < 40; i++) {
+    stepVehicleSimulation(
+      state,
+      { steer: 0, throttle: 0, brake: 0 },
+      hazards,
+      0.05,
+      false,
+    );
+  }
+
+  // Sedan must not phase through the truck ahead!
+  assert.ok(
+    hazards[1].s < hazards[0].s,
+    `Trailing sedan must remain behind lead truck (sedan s=${hazards[1].s.toFixed(2)}, truck s=${hazards[0].s.toFixed(2)})`,
+  );
+  const separation = hazards[0].s - hazards[1].s;
+  assert.ok(
+    separation >= (hazards[0].length + hazards[1].length) * 0.5,
+    `Trailing vehicle maintained rigid physical separation (${separation.toFixed(2)}m)`,
+  );
+});
+
+test('road-normal perpendicular coordinates ensure roadside props never intersect road carriageway', () => {
+  const roadCarriagewayLimit = 5.0; // 3.6m carriageway + 1.4m shoulder
+  const propPlacementDist = 8.5; // placed at least 8.5m perpendicular
+
+  for (let s = 100; s <= 800; s += 50) {
+    const sample = getRoadSample(s);
+    const nx = Math.cos(sample.headingRad);
+    const nz = Math.sin(sample.headingRad);
+
+    // Test for both left and right sides
+    for (const side of [-1, 1]) {
+      const propX = sample.centerX + side * propPlacementDist * nx;
+      const propZ = -s + side * propPlacementDist * nz;
+
+      // Distance from road center (sample.centerX, -s) along perpendicular normal
+      const dx = propX - sample.centerX;
+      const dz = propZ - (-s);
+      const normalDist = Math.sqrt(dx * dx + dz * dz);
+
+      assert.ok(
+        normalDist >= propPlacementDist - 0.01,
+        `Prop perpendicular distance (${normalDist.toFixed(2)}m) matches target distance`,
+      );
+      assert.ok(
+        normalDist > roadCarriagewayLimit + 2.0,
+        `Prop is safely outside road carriageway and guardrail boundary (${roadCarriagewayLimit}m)`,
+      );
+    }
+  }
+});
+

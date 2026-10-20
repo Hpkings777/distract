@@ -8,7 +8,7 @@ export interface RoadSample {
   curvature: number;
 }
 
-export type HazardType = 'sedan' | 'truck' | 'work_zone' | 'braking_car';
+export type HazardType = 'sedan' | 'suv' | 'truck' | 'work_zone' | 'braking_car';
 
 export interface RoadHazard {
   id: number;
@@ -25,6 +25,8 @@ export interface RoadHazard {
   passed: boolean;
   collided: boolean;
   nearMissed: boolean;
+  laneChangeTimer?: number;
+  targetLateralOffset?: number;
 }
 
 /**
@@ -118,12 +120,14 @@ export function createSeededRng(seed: number): () => number {
 }
 
 const VEHICLE_PALETTE = [
-  0x38bdf8, // sky blue
-  0xf59e0b, // amber
-  0xe11d48, // crimson
-  0x10b981, // emerald
-  0xa855f7, // violet
-  0xe2e8f0, // silver
+  0x1e3a8a, // midnight blue metallic
+  0x0284c7, // electric cyan
+  0xd97706, // amber gold metallic
+  0xdc2626, // crimson red
+  0x059669, // british racing green
+  0x7c3aed, // deep violet
+  0x475569, // nardo slate grey
+  0xf8fafc, // polar pearl white
 ];
 
 export function generateInitialHazards(seed = 1042, count = 24): RoadHazard[] {
@@ -134,12 +138,13 @@ export function generateInitialHazards(seed = 1042, count = 24): RoadHazard[] {
   for (let i = 0; i < count; i++) {
     const roll = rng();
     let type: HazardType = 'sedan';
-    if (roll < 0.32) type = 'sedan';
-    else if (roll < 0.56) type = 'braking_car';
-    else if (roll < 0.8) type = 'work_zone';
+    if (roll < 0.28) type = 'sedan';
+    else if (roll < 0.48) type = 'suv';
+    else if (roll < 0.68) type = 'braking_car';
+    else if (roll < 0.84) type = 'work_zone';
     else type = 'truck';
 
-    // Place slightly more hazards in lane 1 (driver's default right lane) to require active lane shifts
+    // Alternate lanes with slight bias towards lane 1 (driver's lane)
     const laneIndex: 0 | 1 = i % 3 === 1 ? 0 : 1;
     const lateralOffset =
       laneIndex === 1
@@ -150,13 +155,30 @@ export function generateInitialHazards(seed = 1042, count = 24): RoadHazard[] {
       type === 'work_zone'
         ? 0
         : type === 'truck'
-        ? 10.5 + rng() * 3.0
+        ? 11.2 + rng() * 2.8
         : type === 'braking_car'
-        ? 15.0 + rng() * 3.0
-        : 13.5 + rng() * 4.5;
+        ? 15.5 + rng() * 2.5
+        : type === 'suv'
+        ? 14.0 + rng() * 3.5
+        : 14.5 + rng() * 4.0;
 
-    const width = type === 'truck' ? 2.3 : type === 'work_zone' ? 2.2 : 1.85;
-    const length = type === 'truck' ? 7.2 : type === 'work_zone' ? 5.0 : 4.2;
+    const width =
+      type === 'truck'
+        ? 2.35
+        : type === 'work_zone'
+        ? 2.2
+        : type === 'suv'
+        ? 1.95
+        : 1.85;
+
+    const length =
+      type === 'truck'
+        ? 7.4
+        : type === 'work_zone'
+        ? 5.2
+        : type === 'suv'
+        ? 4.6
+        : 4.2;
 
     hazards.push({
       id: i + 1,

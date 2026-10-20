@@ -253,12 +253,12 @@ function integrateSubstep(
     const sign = Math.sign(state.lateralOffset);
     state.lateralOffset = sign * maxLat;
     state.lateralVelocity =
-      -sign * Math.max(2.2, Math.abs(state.lateralVelocity) * 0.42);
-    state.speed = Math.max(8.0, state.speed * 0.74);
+      -sign * Math.max(2.6, Math.abs(state.lateralVelocity) * 0.45);
+    state.speed = Math.max(6.0, state.speed * 0.72);
     if (state.collisionCooldown <= 0) {
       state.collisionCooldown = VEHICLE_CONFIG.collisionCooldown;
-      state.hitstopTimer = 0.04;
-      state.trauma = Math.min(0.65, state.trauma + 0.45);
+      state.hitstopTimer = 0.045;
+      state.trauma = Math.min(0.75, state.trauma + 0.5);
       events.push({
         type: 'guardrail',
         relativeSpeed: state.speed,
@@ -267,28 +267,69 @@ function integrateSubstep(
     }
   }
 
-  // 8. Hazard advancement & bounding-box collision checks
+  // 8. Traffic Car-Following AI & Hazard Advancement (prevents traffic cars phasing into each other)
   for (let i = 0; i < hazards.length; i++) {
     const h = hazards[i];
 
-    if (h.s < state.s - 35) {
-      h.s = state.s + 210 + (h.id % 5) * 28;
+    // Recycle hazard if far behind player, ensuring it does not spawn atop another vehicle
+    if (h.s < state.s - 40) {
+      let candidateS = state.s + 200 + (h.id % 6) * 32;
+      // Ensure candidateS is at least 32m away from any other hazard
+      for (const other of hazards) {
+        if (other !== h && Math.abs(other.s - candidateS) < 30) {
+          candidateS += 36;
+        }
+      }
+      h.s = candidateS;
       h.passed = false;
       h.collided = false;
       h.nearMissed = false;
       h.telegraphActive = false;
       h.brakeTriggered = false;
+      if (h.type !== 'work_zone') {
+        h.speed = h.type === 'truck' ? 11.5 : 15.0;
+      }
+    }
+
+    // Traffic AI: Check for lead vehicle in the same lane to avoid phasing into each other
+    if (h.type !== 'work_zone' && h.speed > 0) {
+      let closestAheadDist = Infinity;
+      let leadSpeed = h.speed;
+      let leadCar: RoadHazard | null = null;
+      for (let j = 0; j < hazards.length; j++) {
+        if (i === j) continue;
+        const other = hazards[j];
+        if (other.laneIndex === h.laneIndex && other.s > h.s) {
+          const dist = other.s - h.s;
+          if (dist < closestAheadDist) {
+            closestAheadDist = dist;
+            leadSpeed = other.speed;
+            leadCar = other;
+          }
+        }
+      }
+
+      const safeHeadway = (h.length + (leadCar?.length ?? 4.2)) * 0.5 + 2.0;
+      if (closestAheadDist < safeHeadway && leadCar) {
+        // Hard physical barrier between traffic vehicles — completely eliminates traffic phasing!
+        h.s = leadCar.s - safeHeadway;
+        h.speed = Math.max(0, Math.min(h.speed, leadSpeed * 0.9));
+      } else if (closestAheadDist < 28) {
+        // Smooth car-following deceleration
+        h.speed = Math.max(0, Math.min(h.speed, leadSpeed * 0.95));
+      }
     }
 
     const distAhead = h.s - state.s;
 
+    // Telegraph brake lights when player approaches braking car or work zone
     if (h.type === 'braking_car' && distAhead > 0 && distAhead < 55) {
       h.telegraphActive = true;
       if (distAhead < 38) {
         h.brakeTriggered = true;
-        h.speed = Math.max(6.5, h.speed - 9.0 * subDt);
+        h.speed = Math.max(5.5, h.speed - 9.5 * subDt);
       }
-    } else if (h.type === 'work_zone' && distAhead > 0 && distAhead < 65) {
+    } else if (h.type === 'work_zone' && distAhead > 0 && distAhead < 70) {
       h.telegraphActive = true;
     } else {
       h.telegraphActive = false;
@@ -296,24 +337,66 @@ function integrateSubstep(
 
     h.s += h.speed * subDt;
 
-    const ds = Math.abs(h.s - state.s);
-    const dLat = Math.abs(h.lateralOffset - state.lateralOffset);
-    const minLongitudinal = (h.length + VEHICLE_CONFIG.vehicleLength) * 0.46;
-    const minLateral = (h.width + VEHICLE_CONFIG.vehicleWidth) * 0.46;
+    // 9. Continuous Swept Bounding Box Collision Resolution (NEVER phase through vehicles or work zones)
+    const carHalfLen = VEHICLE_CONFIG.vehicleLength * 0.5;
+    const carHalfWidth = VEHICLE_CONFIG.vehicleWidth * 0.5;
+    const hHalfLen = h.length * 0.5;
+    const hHalfWidth = h.width * 0.5;
 
-    if (ds < minLongitudinal && dLat < minLateral) {
+    // Swept longitudinal span of the player in this substep
+    const playerMinS = Math.min(state.prevS, state.s) - carHalfLen;
+    const playerMaxS = Math.max(state.prevS, state.s) + carHalfLen;
+    const hazardMinS = h.s - hHalfLen;
+    const hazardMaxS = h.s + hHalfLen;
+
+    // Lateral span
+    const playerMinLat = Math.min(state.prevLateralOffset, state.lateralOffset) - carHalfWidth;
+    const playerMaxLat = Math.max(state.prevLateralOffset, state.lateralOffset) + carHalfWidth;
+    const hazardMinLat = h.lateralOffset - hHalfWidth;
+    const hazardMaxLat = h.lateralOffset + hHalfWidth;
+
+    const overlapLongitudinal = playerMaxS >= hazardMinS && playerMinS <= hazardMaxS;
+    const overlapLateral = playerMaxLat >= hazardMinLat && playerMinLat <= hazardMaxLat;
+
+    if (overlapLongitudinal && overlapLateral) {
+      const distFromBumper = Math.abs(state.s - h.s);
+      const actualDLat = Math.abs(state.lateralOffset - h.lateralOffset);
+      const minLongitudinal = carHalfLen + hHalfLen;
+      const minLateral = carHalfWidth + hHalfWidth;
+
+      const penS = minLongitudinal - distFromBumper;
+      const penLat = minLateral - actualDLat;
+
+      if (penS <= penLat || distFromBumper > minLongitudinal * 0.72) {
+        // Front/Rear Bumper Impact
+        if (state.prevS <= h.s) {
+          // Player rear-ends hazard vehicle or work zone:
+          // Pin player rigidly behind hazard, stopping any forward penetration!
+          state.s = h.s - minLongitudinal - 0.05;
+          const relSpeed = Math.max(4.0, state.speed - h.speed);
+          state.speed = Math.max(0, Math.min(state.speed * 0.35, h.speed * 0.75));
+          if (h.type !== 'work_zone') {
+            h.speed = Math.max(h.speed, h.speed + relSpeed * 0.45);
+          }
+        } else {
+          // Hazard caught up or player bounced forward
+          state.s = h.s + minLongitudinal + 0.05;
+          state.speed = Math.max(state.speed, h.speed + 2.0);
+        }
+      } else {
+        // Sideswipe collision: deflect laterally
+        const pushDir = state.lateralOffset >= h.lateralOffset ? 1 : -1;
+        state.lateralOffset = h.lateralOffset + pushDir * (minLateral + 0.08);
+        state.lateralVelocity = pushDir * Math.max(3.5, Math.abs(state.lateralVelocity) * 0.6);
+        state.speed = Math.max(4.0, state.speed * 0.82);
+      }
+
       if (!h.collided && state.collisionCooldown <= 0) {
         h.collided = true;
         state.collisionCooldown = VEHICLE_CONFIG.collisionCooldown;
-        state.hitstopTimer = 0.05;
-        state.trauma = Math.min(0.75, state.trauma + 0.55);
-        const relSpeed = Math.max(5, Math.abs(state.speed - h.speed));
-        state.speed = Math.max(
-          6.0,
-          Math.min(state.speed * 0.52, h.speed * 0.85),
-        );
-        const pushDir = state.lateralOffset >= h.lateralOffset ? 1 : -1;
-        state.lateralVelocity = pushDir * 4.2;
+        state.hitstopTimer = 0.06;
+        state.trauma = Math.min(0.95, state.trauma + 0.65);
+        const relSpeed = Math.max(6, Math.abs(state.speed - h.speed));
         events.push({
           type: 'hazard',
           hazardId: h.id,
@@ -323,7 +406,9 @@ function integrateSubstep(
       }
     } else if (!h.passed && h.s < state.s - 2.0) {
       h.passed = true;
-      if (!h.collided && dLat < minLateral + 0.95) {
+      const actualDLat = Math.abs(state.lateralOffset - h.lateralOffset);
+      const minLateral = carHalfWidth + hHalfWidth;
+      if (!h.collided && actualDLat < minLateral + 1.1) {
         h.nearMissed = true;
         events.push({
           type: 'near_miss',

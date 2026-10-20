@@ -48,6 +48,7 @@ import { SidePatternVisual } from './components/SidePatternCanvas.tsx';
 import { TouchControlsOverlay } from './components/TouchControlsOverlay.tsx';
 import { SettingsModal } from './components/SettingsModal.tsx';
 import type { SettingsTabId } from './components/SettingsModal.tsx';
+import { DriverGazeIcon, ForwardRadarScope } from './components/CustomIcons.tsx';
 
 const REFERENCE_BASELINE_SUMMARY: TrialSummary = {
   trialType: 'baseline',
@@ -85,6 +86,12 @@ interface InterfaceHudSnapshot {
   stimulus: SideStimulusState;
   inputTelemetry: LiveInputTelemetry;
   rendererDiagnostics: RendererDiagnostics;
+  upcomingHazards: Array<{
+    s: number;
+    laneIndex: number;
+    speed: number;
+    type: string;
+  }>;
 }
 
 /**
@@ -363,6 +370,7 @@ function MainSimulatorApp({
       qualityPreset: 'balanced',
       lightingPreset: 'dusk',
     },
+    upcomingHazards: [],
   }));
 
   // Mutable simulation refs
@@ -700,6 +708,18 @@ function MainSimulatorApp({
           stimulus: experimentRef.current.getStimulus(),
           inputTelemetry: telemetry,
           rendererDiagnostics: renderer.getDiagnostics(),
+          upcomingHazards: hazardsRef.current
+            .filter(
+              (h) =>
+                h.s >= vehicleRef.current.s &&
+                h.s <= vehicleRef.current.s + 85,
+            )
+            .map((h) => ({
+              s: Math.round(h.s),
+              laneIndex: h.laneIndex,
+              speed: Number(h.speed.toFixed(1)),
+              type: h.type,
+            })),
         });
       }
     };
@@ -812,7 +832,10 @@ function MainSimulatorApp({
     : 'border-slate-700/80';
 
   return (
-    <div className="relative w-screen h-screen overflow-hidden bg-[#090d16] select-none touch-none">
+    <div
+      onContextMenu={(e) => e.preventDefault()}
+      className="relative w-screen h-screen overflow-hidden bg-[#090d16] select-none touch-none"
+    >
       {/* Isolated WebGL Mount Container */}
       <div
         ref={canvasMountRef}
@@ -1024,12 +1047,15 @@ function MainSimulatorApp({
           STATE 2: GAME-NATIVE MINIMAL DRIVING HUD (>= 88% Clear Viewport)
           ===================================================================== */}
       {gameState === 'playing' && (
-        <div className="fixed inset-0 z-10 pointer-events-none flex flex-col justify-between p-3 sm:p-5">
+        <div
+          onContextMenu={(e) => e.preventDefault()}
+          className="fixed inset-0 z-10 pointer-events-none flex flex-col justify-between p-3 sm:p-5 select-none touch-none"
+        >
           {/* TOP PERIMETER: Compact Run Timer + Center Safety Alert + Top-Right Game Icons */}
           <div className="flex items-start justify-between gap-3">
-            {/* Top-Left Compact Telemetry Pill */}
+            {/* Top-Left Compact Telemetry Pill with Biometric DriverGazeIcon */}
             <div
-              className={`bg-[#090d16]/85 border ${highContrastBorder} rounded-xl px-3.5 py-2 flex items-center gap-3 pointer-events-auto shadow-lg`}
+              className={`bg-[#090d16]/90 border ${highContrastBorder} rounded-xl px-3.5 py-2 flex items-center gap-3 pointer-events-auto shadow-2xl backdrop-blur-md`}
             >
               <div>
                 <div className="text-[10px] font-mono-tabular uppercase tracking-wider text-slate-400">
@@ -1059,15 +1085,25 @@ function MainSimulatorApp({
 
               <div
                 data-testid="attention-status-badge"
-                className={`px-2.5 py-1 rounded-lg border ${attentionBadgeStyle(
+                className={`px-2.5 py-1 rounded-lg border flex items-center gap-2 ${attentionBadgeStyle(
                   hud.attention.state,
                 )}`}
               >
-                <div className="text-[9px] font-mono-tabular uppercase tracking-wider opacity-85">
-                  GAZE ({hud.attention.mode === 'webcam' ? 'CAM' : 'SIM'})
-                </div>
-                <div className="text-xs font-display font-bold tracking-wide">
-                  {hud.attention.state}
+                <DriverGazeIcon
+                  className="w-5 h-5 shrink-0"
+                  active={hud.attention.state === 'ATTENTIVE'}
+                  alert={
+                    hud.attention.state === 'DISTRACTED' ||
+                    hud.attention.state === 'POSSIBLY_DISTRACTED'
+                  }
+                />
+                <div>
+                  <div className="text-[9px] font-mono-tabular uppercase tracking-wider opacity-85">
+                    GAZE ({hud.attention.mode === 'webcam' ? 'CAM' : 'SIM'})
+                  </div>
+                  <div className="text-xs font-display font-bold tracking-wide">
+                    {hud.attention.state}
+                  </div>
                 </div>
               </div>
             </div>
@@ -1351,66 +1387,130 @@ function MainSimulatorApp({
             </div>
           )}
 
-          {/* BOTTOM PERIMETER: Game-Native Automotive Instrument Cluster */}
+          {/* BOTTOM PERIMETER: High-End Automotive Cockpit Cluster & Forward Radar */}
           <div
-            className={`flex items-end gap-2.5 mt-auto ${
+            className={`flex items-end gap-2 sm:gap-3 mt-auto w-full max-w-full ${
               showTouchControls
                 ? 'justify-center pb-24 sm:pb-0'
                 : 'justify-between'
             }`}
           >
-            {/* Bottom-Left Automotive Speed, Gear & RPM Cluster */}
+            {/* Bottom-Left Automotive Speed, Gear, Tachometer & Forward Radar Scope */}
             <div
-              className={`bg-[#090d16]/85 border ${highContrastBorder} rounded-xl px-3.5 py-2 shadow-lg pointer-events-auto flex items-center gap-3`}
+              className={`bg-[#070b14]/94 border ${highContrastBorder} rounded-2xl p-2 sm:p-2.5 shadow-2xl pointer-events-auto flex items-center gap-2 sm:gap-3 backdrop-blur-md`}
             >
+              {/* Forward Traffic & Hazard Radar Scope (Desktop / Large Viewports) */}
+              <div className="hidden md:block">
+                <ForwardRadarScope
+                  hazards={hud.upcomingHazards}
+                  playerS={hud.distanceMeters}
+                  className="w-18 h-18 sm:w-20 sm:h-20"
+                />
+              </div>
+
+              {/* Digital Speedometer & MPH */}
               <div>
-                <div className="text-[10px] font-mono-tabular uppercase tracking-widest text-slate-400">
-                  SPEED
+                <div className="flex items-center justify-between text-[10px] font-mono-tabular uppercase tracking-widest text-slate-400">
+                  <span>SPEED</span>
+                  <span className="text-slate-500 text-[9px]">
+                    {Math.round(hud.speedKmh * 0.621)} MPH
+                  </span>
                 </div>
-                <div className="flex items-baseline gap-1">
+                <div className="flex items-baseline gap-1 my-0.5">
                   <span
                     data-testid="speed-readout"
-                    className="font-display font-bold text-2xl sm:text-3xl text-white font-mono-tabular leading-none hud-text-stroke"
+                    className="font-display font-bold text-2xl sm:text-4xl text-white font-mono-tabular leading-none hud-text-stroke tracking-tight"
                   >
                     {hud.speedKmh}
                   </span>
-                  <span className="text-[10px] font-mono-tabular text-amber-400 font-semibold">
+                  <span className="text-[10px] sm:text-[11px] font-mono-tabular text-amber-400 font-bold">
                     KM/H
                   </span>
                 </div>
+                <div className="text-[8px] sm:text-[9px] font-mono-tabular text-slate-400 flex items-center gap-1">
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                  <span>{hud.inputTelemetry.activeSource.toUpperCase()}</span>
+                </div>
               </div>
 
-              {/* Drive Gear & RPM Bar */}
-              <div className="flex flex-col gap-1 w-20 sm:w-24">
-                <div className="flex items-center justify-between text-[10px] font-mono-tabular">
+              <div className="h-10 sm:h-12 w-px bg-slate-800" />
+
+              {/* Drive Gear & Dynamic RPM Arc Bar */}
+              <div className="flex flex-col gap-1 w-20 sm:w-26">
+                <div className="flex items-center justify-between text-[9px] sm:text-[10px] font-mono-tabular">
                   <span className="text-slate-400">GEAR</span>
-                  <span className="text-amber-400 font-bold">D{hud.gear}</span>
+                  <span className="px-1.5 py-0.5 rounded bg-amber-500/20 border border-amber-400/40 text-amber-300 font-bold text-xs">
+                    D{hud.gear}
+                  </span>
                 </div>
-                <div className="w-full h-1.5 bg-slate-800 rounded overflow-hidden">
+                {/* 3-Stage RPM Shift Lights: Normal (Cyan) -> Power (Amber) -> Redline (Crimson) */}
+                <div className="w-full h-1.5 sm:h-2 bg-slate-900 rounded-full border border-slate-700/80 overflow-hidden flex p-0.5">
                   <div
-                    className={`h-full ${
-                      hud.rpmNormalized > 0.85 ? 'bg-rose-500' : 'bg-sky-400'
+                    className={`h-full rounded-full transition-all duration-75 ${
+                      hud.rpmNormalized > 0.85
+                        ? 'bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.9)] animate-pulse'
+                        : hud.rpmNormalized > 0.6
+                        ? 'bg-amber-400'
+                        : 'bg-sky-400'
                     }`}
                     style={{
                       width: `${Math.round(hud.rpmNormalized * 100)}%`,
                     }}
                   />
                 </div>
-                <div className="text-[9px] font-mono-tabular text-slate-400 truncate">
-                  {hud.inputTelemetry.activeSource.toUpperCase()} INPUT
+                <div className="flex justify-between text-[8px] font-mono-tabular text-slate-400">
+                  <span>IDLE</span>
+                  <span
+                    className={
+                      hud.rpmNormalized > 0.85
+                        ? 'text-rose-400 font-bold'
+                        : 'text-slate-400'
+                    }
+                  >
+                    {hud.rpmNormalized > 0.85 ? 'SHIFT!' : '8K RPM'}
+                  </span>
                 </div>
               </div>
             </div>
 
-            {/* Bottom-Right Compact Lane Status & Trial Controls */}
+            {/* Bottom-Right Highway Lane Drift Monitor & Action Buttons */}
             <div
-              className={`bg-[#090d16]/85 border ${highContrastBorder} rounded-xl px-3.5 py-2 shadow-lg pointer-events-auto flex items-center gap-3`}
+              className={`bg-[#070b14]/94 border ${highContrastBorder} rounded-2xl p-2 sm:p-2.5 shadow-2xl pointer-events-auto flex items-center gap-2 sm:gap-3 backdrop-blur-md`}
             >
+              {/* Graphic Lane Visualizer */}
+              <div className="hidden sm:flex flex-col items-center">
+                <div className="text-[9px] font-mono-tabular uppercase tracking-wider text-slate-400 mb-1">
+                  LANE
+                </div>
+                <div className="w-16 h-8 rounded bg-[#090d16] border border-slate-700 relative flex items-center justify-center overflow-hidden">
+                  {/* Left & Right Lane Boundaries */}
+                  <div className="absolute inset-y-0 left-1 w-0.5 bg-slate-500" />
+                  <div className="absolute inset-y-0 right-1 w-0.5 bg-slate-500" />
+                  {/* Dashed Center Stripe */}
+                  <div className="absolute inset-y-0 left-1/2 -translate-x-1/2 w-0.5 border-l border-dashed border-amber-400/60" />
+                  {/* Car Dot Position */}
+                  <div
+                    className={`w-2.5 h-3.5 rounded-sm border transition-all duration-75 ${
+                      hud.isOutOfLane
+                        ? 'bg-rose-500 border-white shadow-[0_0_8px_rgba(244,63,94,0.8)]'
+                        : 'bg-emerald-400 border-slate-900 shadow-[0_0_6px_rgba(52,211,153,0.8)]'
+                    }`}
+                    style={{
+                      transform: `translateX(${Math.max(
+                        -22,
+                        Math.min(22, (hud.lateralOffset - ROAD_CONFIG.playerDefaultLaneOffset) * 16),
+                      )}px)`,
+                    }}
+                  />
+                </div>
+              </div>
+
+              {/* Lane Drift Deviation Metric */}
               <div>
                 <div className="text-[10px] font-mono-tabular uppercase tracking-widest text-slate-400">
-                  LANE DRIFT
+                  DRIFT
                 </div>
-                <div className="flex items-baseline gap-1">
+                <div className="flex items-baseline gap-1 my-0.5">
                   <span
                     data-testid="lane-deviation-readout"
                     className={`font-display font-bold text-2xl sm:text-3xl font-mono-tabular leading-none ${
@@ -1419,9 +1519,16 @@ function MainSimulatorApp({
                   >
                     {hud.laneDeviationMeters.toFixed(2)}m
                   </span>
-                  <span className="text-[10px] font-mono-tabular text-slate-300">
+                  <span
+                    className={`text-[10px] font-mono-tabular font-bold ${
+                      hud.isOutOfLane ? 'text-rose-400' : 'text-emerald-400'
+                    }`}
+                  >
                     {hud.isOutOfLane ? 'DEPART' : 'OK'}
                   </span>
+                </div>
+                <div className="text-[9px] font-mono-tabular text-slate-400">
+                  TOLERANCE ±{ROAD_CONFIG.safeLaneTolerance}m
                 </div>
               </div>
 
@@ -1442,7 +1549,7 @@ function MainSimulatorApp({
                 </div>
               )}
 
-              <div className="flex items-center gap-1.5">
+              <div className="flex items-center gap-2">
                 {!showTouchControls && (
                   <button
                     type="button"
@@ -1453,13 +1560,18 @@ function MainSimulatorApp({
                         isLookAwayActive ? 'none' : 'left',
                       );
                     }}
-                    className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold cursor-pointer whitespace-nowrap ${
+                    className={`h-9 px-3 rounded-xl text-xs font-display font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap transition-all shadow-md ${
                       isLookAwayActive
-                        ? 'bg-rose-600 text-white'
-                        : 'bg-slate-800 hover:bg-slate-700 text-slate-200'
+                        ? 'bg-rose-600 text-white shadow-[0_0_15px_rgba(244,63,94,0.6)] animate-pulse'
+                        : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-600'
                     }`}
                   >
-                    {isLookAwayActive ? 'Look Forward' : 'Look Away [L]'}
+                    <DriverGazeIcon
+                      className="w-4 h-4"
+                      active={!isLookAwayActive}
+                      alert={isLookAwayActive}
+                    />
+                    <span>{isLookAwayActive ? 'Look Forward' : 'Look Away [L]'}</span>
                   </button>
                 )}
 
@@ -1467,9 +1579,9 @@ function MainSimulatorApp({
                   type="button"
                   tabIndex={-1}
                   onClick={finishCurrentTrialAndShowResults}
-                  className="px-2.5 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-xs cursor-pointer whitespace-nowrap"
+                  className="h-9 px-3.5 rounded-xl bg-gradient-to-r from-amber-500 to-amber-400 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-display font-bold text-xs cursor-pointer whitespace-nowrap shadow-md active:scale-95 transition-transform flex items-center gap-1"
                 >
-                  Results [F]
+                  <span>Results [F]</span>
                 </button>
               </div>
             </div>
