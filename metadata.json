@@ -1,0 +1,6 @@
+{
+  "name": "DISTRACT — Driver Attention & Road Safety Simulator",
+  "description": "Interactive 3D first-person driving and road safety exhibition simulator demonstrating how visual and cognitive distraction affects lane keeping, hazard reaction time, and vehicle control.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
