@@ -144,6 +144,39 @@ export class SoundEngine {
     osc.stop(now + 0.19);
   }
 
+  public playDrowsinessCriticalAlarm(): void {
+    const ctx = this.ensureContext();
+    if (!ctx || this.settings.alertVolume <= 0.01) return;
+    const now = ctx.currentTime;
+    if (now - this.lastAlarmTime < 0.22) return;
+    this.lastAlarmTime = now;
+
+    // Dual-tone urgent ADAS horn/chime (1200Hz + 800Hz)
+    const osc1 = ctx.createOscillator();
+    const osc2 = ctx.createOscillator();
+    const gain = ctx.createGain();
+
+    osc1.type = 'sawtooth';
+    osc2.type = 'square';
+    osc1.frequency.setValueAtTime(987.77, now);
+    osc1.frequency.setValueAtTime(1318.51, now + 0.07);
+    osc2.frequency.setValueAtTime(659.25, now);
+    osc2.frequency.setValueAtTime(880.0, now + 0.07);
+
+    const peak = 0.22 * this.settings.alertVolume;
+    gain.gain.setValueAtTime(Math.max(0.002, peak), now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
+
+    osc1.connect(gain);
+    osc2.connect(gain);
+    gain.connect(ctx.destination);
+
+    osc1.start(now);
+    osc2.start(now);
+    osc1.stop(now + 0.19);
+    osc2.stop(now + 0.19);
+  }
+
   public playRumbleTick(): void {
     const ctx = this.ensureContext();
     if (!ctx || this.settings.roadVolume <= 0.01) return;

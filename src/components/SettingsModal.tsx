@@ -1,18 +1,26 @@
 import React, { useEffect, useState } from 'react';
 import QRCode from 'qrcode';
 import {
+  CAMERA_VIEW_MODES,
   LIGHTING_PRESETS,
+  MAP_PRESETS,
   QUALITY_PRESETS,
+  TRAFFIC_DENSITY_COUNTS,
 } from '../config.ts';
 import type {
   AccessibilitySettings,
   AudioSettings,
+  CameraViewMode,
   LightingPreset,
+  MapPreset,
   QualityPreset,
   SideDisplayConfig,
   SidePatternType,
   StimulusIntensityLevel,
   TouchControlsMode,
+  TrafficAggressionPreset,
+  TrafficConfig,
+  TrafficDensityPreset,
 } from '../config.ts';
 import type {
   ControllerCalibrationSettings,
@@ -23,6 +31,7 @@ import type { NetworkTelemetry } from '../network.ts';
 import type { RendererDiagnostics } from '../scene.ts';
 
 export type SettingsTabId =
+  | 'world'
   | 'display'
   | 'controls'
   | 'sidedisplays'
@@ -33,6 +42,12 @@ export type SettingsTabId =
 interface SettingsModalProps {
   initialTab?: SettingsTabId;
   onClose: () => void;
+  mapPreset: MapPreset;
+  onChangeMap: (m: MapPreset) => void;
+  trafficConfig: TrafficConfig;
+  onUpdateTrafficConfig: (partial: Partial<TrafficConfig>) => void;
+  cameraView: CameraViewMode;
+  onChangeCameraView: (view: CameraViewMode) => void;
   qualityPreset: QualityPreset;
   onChangeQuality: (q: QualityPreset) => void;
   lightingPreset: LightingPreset;
@@ -62,17 +77,24 @@ interface SettingsModalProps {
 }
 
 const TABS: Array<{ id: SettingsTabId; label: string }> = [
-  { id: 'display', label: 'Display & Graphics' },
-  { id: 'controls', label: 'Controls & Input' },
+  { id: 'world', label: 'Map & Traffic' },
+  { id: 'display', label: 'Graphics & View' },
+  { id: 'controls', label: 'Controls & Wheel' },
   { id: 'sidedisplays', label: 'Side Displays' },
-  { id: 'camera', label: 'Camera & Attention' },
+  { id: 'camera', label: 'Gaze & Webcam' },
   { id: 'audio', label: 'Audio' },
   { id: 'accessibility', label: 'Accessibility' },
 ];
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
-  initialTab = 'display',
+  initialTab = 'world',
   onClose,
+  mapPreset,
+  onChangeMap,
+  trafficConfig,
+  onUpdateTrafficConfig,
+  cameraView,
+  onChangeCameraView,
   qualityPreset,
   onChangeQuality,
   lightingPreset,
@@ -100,7 +122,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [leftQrDataUrl, setLeftQrDataUrl] = useState<string>('');
   const [rightQrDataUrl, setRightQrDataUrl] = useState<string>('');
 
-  // Compute sharable base URL (prefer detected LAN IP or Cloud APP_URL over localhost when available)
   const baseOrigin =
     networkTelemetry.lanUrls[0] ||
     networkTelemetry.appUrl ||
@@ -159,7 +180,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     return (
       <div
         data-testid={`side-status-${side}`}
-        className={`px-2.5 py-1 rounded text-xs font-mono-tabular border ${
+        className={`px-2.5 py-1 rounded-sm text-xs font-mono-tabular border ${
           isConnected
             ? 'bg-emerald-950/90 border-emerald-500/60 text-emerald-300'
             : isLagging
@@ -182,25 +203,25 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     <div
       role="dialog"
       aria-label="Simulator Settings"
-      className="fixed inset-0 z-40 bg-[#090d16]/90 flex items-center justify-center p-3 sm:p-6 overflow-y-auto"
+      className="fixed inset-0 z-40 bg-[#060911]/90 flex items-center justify-center p-3 sm:p-6 overflow-y-auto"
     >
-      <div className="w-full max-w-4xl bg-[#0d1424] border border-slate-700/90 rounded-2xl shadow-2xl overflow-hidden my-auto flex flex-col max-h-[92vh]">
+      <div className="w-full max-w-4xl bg-[#0a0f1d] border border-slate-700/90 rounded-sm shadow-2xl overflow-hidden my-auto flex flex-col max-h-[92vh]">
         {/* Modal Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800 bg-[#090d16]">
+        <div className="flex items-center justify-between px-5 py-3.5 border-b border-slate-800 bg-[#060911]">
           <div>
-            <div className="text-[11px] font-mono-tabular uppercase tracking-widest text-amber-400">
-              SYSTEM CONFIGURATION &amp; EXHIBITION MANAGEMENT
+            <div className="text-[10px] font-mono-tabular uppercase tracking-widest text-amber-400">
+              SYSTEM TELEMETRY, ENVIRONMENT &amp; TRAFFIC CONTROL
             </div>
-            <h2 className="text-xl font-display font-bold text-white">
-              Simulator Settings
+            <h2 className="text-xl font-display font-bold text-white uppercase tracking-wide">
+              Simulator Configuration
             </h2>
           </div>
           <button
             type="button"
             onClick={onClose}
-            className="px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-xs tracking-wide cursor-pointer whitespace-nowrap"
+            className="px-4 py-2 rounded-sm bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-xs uppercase tracking-wider cursor-pointer whitespace-nowrap"
           >
-            Done &amp; Return
+            Apply &amp; Return
           </button>
         </div>
 
@@ -208,7 +229,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         <div
           role="tablist"
           aria-label="Settings Categories"
-          className="flex items-center gap-1 px-4 py-2.5 bg-slate-950 border-b border-slate-800 overflow-x-auto"
+          className="flex items-center gap-1 px-4 py-2 bg-slate-950 border-b border-slate-800 overflow-x-auto"
         >
           {TABS.map((t) => (
             <button
@@ -217,9 +238,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               role="tab"
               aria-selected={activeTab === t.id}
               onClick={() => setActiveTab(t.id)}
-              className={`px-3.5 py-2 rounded-lg text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+              className={`px-3.5 py-1.5 rounded-sm text-xs font-mono-tabular font-semibold uppercase tracking-wider transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                 activeTab === t.id
-                  ? 'bg-sky-500 text-slate-950'
+                  ? 'bg-amber-500 text-slate-950 font-bold'
                   : 'text-slate-300 hover:bg-slate-800/80'
               }`}
             >
@@ -230,18 +251,241 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
         {/* Tab Body */}
         <div className="p-5 overflow-y-auto space-y-5 text-sm">
-          {/* 1. DISPLAY & GRAPHICS */}
+          {/* 0. MAP & TRAFFIC CONTROL */}
+          {activeTab === 'world' && (
+            <div className="space-y-5">
+              {/* Highway Map / Biome Selector */}
+              <div className="bg-slate-950 border border-slate-800 rounded-sm p-4">
+                <div className="flex items-center justify-between mb-3">
+                  <span className="text-xs font-mono-tabular uppercase text-amber-400 font-semibold">
+                    HIGHWAY ROUTE &amp; 3D ENVIRONMENT MAP
+                  </span>
+                  <span className="text-xs font-mono-tabular text-slate-400">
+                    Active: {MAP_PRESETS[mapPreset].label}
+                  </span>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  {(Object.keys(MAP_PRESETS) as MapPreset[]).map((m) => {
+                    const preset = MAP_PRESETS[m];
+                    const selected = mapPreset === m;
+                    return (
+                      <button
+                        key={m}
+                        type="button"
+                        data-testid={`settings-map-${m}`}
+                        onClick={() => onChangeMap(m)}
+                        className={`p-3.5 rounded-sm border text-left cursor-pointer transition-colors ${
+                          selected
+                            ? 'bg-amber-500/15 border-amber-400 text-white'
+                            : 'bg-slate-900/80 border-slate-800 text-slate-300 hover:border-slate-600'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="font-display font-bold text-sm uppercase tracking-wide">
+                            {preset.label}
+                          </span>
+                          <span className="text-[10px] font-mono-tabular px-1.5 py-0.5 rounded-sm bg-slate-950 border border-slate-700 text-amber-300">
+                            {preset.shortLabel}
+                          </span>
+                        </div>
+                        <p className="text-xs text-slate-400 mt-1">
+                          {preset.subtitle}
+                        </p>
+                        <div className="text-[10px] font-mono-tabular text-slate-500 mt-1.5">
+                          Curve Intensity: {preset.curveScale.toFixed(2)}x ·
+                          Elevation Grade: {preset.hillScale.toFixed(1)}x
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Traffic Density & AI Vehicle Control */}
+              <div className="bg-slate-950 border border-slate-800 rounded-sm p-4 space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="text-xs font-mono-tabular uppercase text-sky-400 font-semibold">
+                      HIGHWAY TRAFFIC DENSITY &amp; AI FLOW CONTROL
+                    </div>
+                    <div className="text-xs text-slate-400 mt-0.5">
+                      Control the volume, speed, braking behavior, and roadwork
+                      hazards on the highway
+                    </div>
+                  </div>
+                  <span
+                    data-testid="traffic-density-badge"
+                    className="px-2.5 py-1 rounded-sm bg-slate-900 border border-slate-700 text-xs font-mono-tabular text-emerald-300"
+                  >
+                    {TRAFFIC_DENSITY_COUNTS[trafficConfig.density]} ACTIVE VEHICLES
+                  </span>
+                </div>
+
+                {/* Density Buttons */}
+                <div>
+                  <div className="text-[11px] font-mono-tabular uppercase text-slate-400 mb-2">
+                    TRAFFIC VOLUME DENSITY
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                    {(
+                      [
+                        { id: 'none', label: 'Off (Empty Road)', desc: '0 AI Vehicles' },
+                        { id: 'light', label: 'Light Flow', desc: '10 AI Vehicles' },
+                        { id: 'normal', label: 'Normal Highway', desc: '22 AI Vehicles' },
+                        { id: 'heavy', label: 'Heavy Rush Hour', desc: '36 AI Vehicles' },
+                      ] as Array<{
+                        id: TrafficDensityPreset;
+                        label: string;
+                        desc: string;
+                      }>
+                    ).map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        data-testid={`traffic-density-${opt.id}`}
+                        onClick={() =>
+                          onUpdateTrafficConfig({ density: opt.id })
+                        }
+                        className={`p-2.5 rounded-sm border text-left cursor-pointer transition-colors ${
+                          trafficConfig.density === opt.id
+                            ? 'bg-sky-500/20 border-sky-400 text-white'
+                            : 'bg-slate-900 border-slate-800 text-slate-300 hover:border-slate-600'
+                        }`}
+                      >
+                        <div className="font-display font-bold text-xs uppercase">
+                          {opt.label}
+                        </div>
+                        <div className="text-[10px] font-mono-tabular text-slate-400 mt-0.5">
+                          {opt.desc}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Traffic Braking Behavior & Speed Multiplier */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 border-t border-slate-800/80">
+                  <div>
+                    <div className="text-[11px] font-mono-tabular uppercase text-slate-400 mb-2">
+                      EMERGENCY BRAKING FREQUENCY
+                    </div>
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {(
+                        [
+                          { id: 'calm', label: 'Calm' },
+                          { id: 'normal', label: 'Normal' },
+                          { id: 'aggressive', label: 'Sudden Stops' },
+                        ] as Array<{
+                          id: TrafficAggressionPreset;
+                          label: string;
+                        }>
+                      ).map((agg) => (
+                        <button
+                          key={agg.id}
+                          type="button"
+                          onClick={() =>
+                            onUpdateTrafficConfig({ aggression: agg.id })
+                          }
+                          className={`py-2 px-2 rounded-sm text-xs font-semibold border cursor-pointer ${
+                            trafficConfig.aggression === agg.id
+                              ? 'bg-amber-500 text-slate-950 border-amber-400'
+                              : 'bg-slate-900 text-slate-300 border-slate-800'
+                          }`}
+                        >
+                          {agg.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col justify-between">
+                    <label className="flex items-center justify-between gap-3 text-xs">
+                      <span className="text-slate-300 font-mono-tabular">
+                        TRAFFIC SPEED SCALE:{' '}
+                        {Math.round(trafficConfig.speedMultiplier * 100)}%
+                      </span>
+                      <input
+                        type="range"
+                        min="0.6"
+                        max="1.4"
+                        step="0.1"
+                        value={trafficConfig.speedMultiplier}
+                        onChange={(e) =>
+                          onUpdateTrafficConfig({
+                            speedMultiplier: parseFloat(e.target.value),
+                          })
+                        }
+                        className="w-36 accent-sky-400"
+                      />
+                    </label>
+
+                    <label className="flex items-center justify-between gap-3 text-xs pt-2 cursor-pointer">
+                      <span className="text-slate-300">
+                        Include Work Zones &amp; Arrow Board Trucks
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={trafficConfig.allowWorkZones}
+                        onChange={(e) =>
+                          onUpdateTrafficConfig({
+                            allowWorkZones: e.target.checked,
+                          })
+                        }
+                        className="w-4 h-4 accent-amber-400"
+                      />
+                    </label>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 1. DISPLAY, CAMERA VIEW & GRAPHICS */}
           {activeTab === 'display' && (
             <div className="space-y-5">
+              {/* Camera View Mode Selector */}
+              <div className="bg-slate-950 border border-slate-800 rounded-sm p-4">
+                <div className="text-xs font-mono-tabular uppercase text-amber-400 mb-2.5 font-semibold">
+                  DRIVING CAMERA PERSPECTIVE (SHORTCUT: [C])
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                  {(['cockpit', 'chase', 'hood'] as CameraViewMode[]).map(
+                    (v) => (
+                      <button
+                        key={v}
+                        type="button"
+                        onClick={() => onChangeCameraView(v)}
+                        className={`p-3 rounded-sm border text-left cursor-pointer transition-colors ${
+                          cameraView === v
+                            ? 'bg-amber-500/15 border-amber-400 text-white'
+                            : 'bg-slate-900/80 border-slate-800 text-slate-300 hover:border-slate-600'
+                        }`}
+                      >
+                        <div className="font-display font-bold text-sm uppercase">
+                          {CAMERA_VIEW_MODES[v].label}
+                        </div>
+                        <div className="text-xs text-slate-400 mt-1">
+                          {v === 'cockpit'
+                            ? '3D interior dash, steering wheel & mirrors'
+                            : v === 'chase'
+                            ? '3rd-person view of GT widebody sports coupe'
+                            : 'Low front hood sense-of-speed view'}
+                        </div>
+                      </button>
+                    ),
+                  )}
+                </div>
+              </div>
+
               {/* Renderer & Performance Diagnostics */}
-              <div className="bg-slate-950 border border-slate-800 rounded-xl p-4">
+              <div className="bg-slate-950 border border-slate-800 rounded-sm p-4">
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
                   <span className="text-xs font-mono-tabular uppercase text-sky-400 font-semibold">
                     RENDERER BACKEND &amp; PERFORMANCE STATUS
                   </span>
                   <span
                     data-testid="renderer-backend-status"
-                    className="px-2.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-xs font-mono-tabular text-emerald-300"
+                    className="px-2.5 py-0.5 rounded-sm bg-slate-900 border border-slate-700 text-xs font-mono-tabular text-emerald-300"
                   >
                     {rendererDiagnostics.activeBackend} ·{' '}
                     {rendererDiagnostics.frameTimeMs}ms (
@@ -254,7 +498,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
 
               {/* Graphics Quality Preset */}
-              <div className="bg-slate-950 border border-slate-800 rounded-xl p-4">
+              <div className="bg-slate-950 border border-slate-800 rounded-sm p-4">
                 <div className="text-xs font-mono-tabular uppercase text-slate-400 mb-2.5">
                   GRAPHICS QUALITY PRESET
                 </div>
@@ -264,7 +508,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       key={p}
                       type="button"
                       onClick={() => onChangeQuality(p)}
-                      className={`p-3 rounded-xl border text-left cursor-pointer transition-colors ${
+                      className={`p-3 rounded-sm border text-left cursor-pointer transition-colors ${
                         qualityPreset === p
                           ? 'bg-amber-500/15 border-amber-400 text-white'
                           : 'bg-slate-900/80 border-slate-800 text-slate-300 hover:border-slate-600'
@@ -283,7 +527,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
 
               {/* Atmospheric Lighting Preset */}
-              <div className="bg-slate-950 border border-slate-800 rounded-xl p-4">
+              <div className="bg-slate-950 border border-slate-800 rounded-sm p-4">
                 <div className="text-xs font-mono-tabular uppercase text-slate-400 mb-2.5">
                   ATMOSPHERIC LIGHTING &amp; TIME OF DAY
                 </div>
@@ -293,7 +537,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       key={l}
                       type="button"
                       onClick={() => onChangeLighting(l)}
-                      className={`p-3 rounded-xl border text-left cursor-pointer transition-colors ${
+                      className={`p-3 rounded-sm border text-left cursor-pointer transition-colors ${
                         lightingPreset === l
                           ? 'bg-sky-500/15 border-sky-400 text-white'
                           : 'bg-slate-900/80 border-slate-800 text-slate-300 hover:border-slate-600'
@@ -304,7 +548,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       </div>
                       <div className="text-xs text-slate-400 mt-1">
                         {LIGHTING_PRESETS[l].headlightsActive
-                          ? 'Headlights & Emissive Beacons Active'
+                          ? 'Real-time SpotLight Headlamps Active'
                           : 'High Visibility Daylight'}
                       </div>
                     </button>
@@ -317,8 +561,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           {/* 2. CONTROLS & INPUT */}
           {activeTab === 'controls' && (
             <div className="space-y-4">
-              {/* Detected Capabilities Banner */}
-              <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
+              <div className="bg-slate-950 border border-slate-800 rounded-sm p-4 flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <div className="text-xs font-mono-tabular uppercase text-sky-400 font-semibold">
                     DETECTED INPUT CAPABILITIES
@@ -335,7 +578,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </div>
                 </div>
                 <span
-                  className={`px-2.5 py-1 rounded text-xs font-mono-tabular ${
+                  className={`px-2.5 py-1 rounded-sm text-xs font-mono-tabular ${
                     inputTelemetry.steeringChangeDetected
                       ? 'bg-emerald-950 text-emerald-300 border border-emerald-500/50'
                       : 'bg-amber-950 text-amber-300 border border-amber-500/50'
@@ -347,8 +590,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </span>
               </div>
 
-              {/* Mobile / Tablet Touch Controls Mode */}
-              <div className="bg-slate-950 border border-slate-800 rounded-xl p-4">
+              <div className="bg-slate-950 border border-slate-800 rounded-sm p-4">
                 <div className="text-xs font-mono-tabular uppercase text-slate-400 mb-2">
                   ON-SCREEN TOUCH CONTROLS (MOBILE &amp; TABLET)
                 </div>
@@ -368,7 +610,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           touchControlsMode: opt.id,
                         })
                       }
-                      className={`py-2 px-3 rounded-lg text-xs font-semibold border cursor-pointer ${
+                      className={`py-2 px-3 rounded-sm text-xs font-semibold border cursor-pointer ${
                         accessibilitySettings.touchControlsMode === opt.id
                           ? 'bg-amber-500 text-slate-950 border-amber-400'
                           : 'bg-slate-900 text-slate-300 border-slate-800'
@@ -380,8 +622,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               </div>
 
-              {/* USB Steering Wheel & Axis Calibration */}
-              <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3">
+              <div className="bg-slate-950 border border-slate-800 rounded-sm p-4 space-y-3">
                 <div className="text-xs font-mono-tabular uppercase text-slate-400">
                   STEERING SENSITIVITY, DEAD ZONE &amp; USB WHEEL CALIBRATION
                 </div>
@@ -394,7 +635,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     {inputTelemetry.rawAxes.map((v, i) => (
                       <span
                         key={i}
-                        className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-slate-300"
+                        className="px-2 py-0.5 rounded-sm bg-slate-900 border border-slate-700 text-slate-300"
                       >
                         Axis {i}: {v.toFixed(2)}
                       </span>
@@ -448,7 +689,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <button
                     type="button"
                     onClick={onCalibrateWheelCenter}
-                    className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 cursor-pointer"
+                    className="px-3 py-1.5 rounded-sm bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 cursor-pointer"
                   >
                     Calibrate Current Wheel Center
                   </button>
@@ -487,8 +728,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           {/* 3. SIDE DISPLAYS & REMOTE QR CONNECTION */}
           {activeTab === 'sidedisplays' && (
             <div className="space-y-4">
-              {/* Connection Status Header & Reconnect Action */}
-              <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3">
+              <div className="bg-slate-950 border border-slate-800 rounded-sm p-4 flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <div className="text-xs font-mono-tabular uppercase text-amber-400 font-semibold">
                     LOW-LATENCY SIDE-DISPLAY SYNCHRONIZATION
@@ -520,17 +760,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <button
                     type="button"
                     onClick={onReconnectNetwork}
-                    className="px-3 py-1.5 rounded-lg bg-sky-500 hover:bg-sky-400 text-slate-950 font-semibold text-xs cursor-pointer whitespace-nowrap"
+                    className="px-3 py-1.5 rounded-sm bg-sky-500 hover:bg-sky-400 text-slate-950 font-semibold text-xs cursor-pointer whitespace-nowrap"
                   >
                     Reconnect &amp; Sync Now
                   </button>
                 </div>
               </div>
 
-              {/* Left & Right Display Cards with URLs, QR Codes, Patterns & Intensity */}
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {/* LEFT DISPLAY CONFIG */}
-                <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3">
+                <div className="bg-slate-950 border border-slate-800 rounded-sm p-4 space-y-3">
                   <div className="flex items-center justify-between">
                     <span className="font-display font-bold text-base text-white">
                       Left Distraction Display
@@ -544,7 +782,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         src={leftQrDataUrl}
                         alt="QR Code for Left Side Display"
                         referrerPolicy="no-referrer"
-                        className="w-24 h-24 rounded-lg border border-slate-700 shrink-0"
+                        className="w-24 h-24 rounded-sm border border-slate-700 shrink-0"
                       />
                     )}
                     <div className="space-y-1.5 min-w-0 flex-1">
@@ -556,20 +794,20 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         readOnly
                         aria-label="Left Display URL"
                         value={leftDisplayUrl}
-                        className="w-full px-2 py-1 rounded bg-slate-900 border border-slate-800 text-[11px] font-mono-tabular text-slate-200"
+                        className="w-full px-2 py-1 rounded-sm bg-slate-900 border border-slate-800 text-[11px] font-mono-tabular text-slate-200"
                       />
                       <div className="flex gap-1.5">
                         <button
                           type="button"
                           onClick={() => openSideUrl(leftDisplayUrl)}
-                          className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 cursor-pointer"
+                          className="px-2.5 py-1 rounded-sm bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 cursor-pointer"
                         >
                           Open Left Window
                         </button>
                         <button
                           type="button"
                           onClick={() => onTriggerTestStimulus('left')}
-                          className="px-2.5 py-1 rounded bg-amber-500/20 border border-amber-500/50 text-amber-300 text-xs font-semibold cursor-pointer"
+                          className="px-2.5 py-1 rounded-sm bg-amber-500/20 border border-amber-500/50 text-amber-300 text-xs font-semibold cursor-pointer"
                         >
                           Test Left Pulse
                         </button>
@@ -590,7 +828,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             leftPattern: e.target.value as SidePatternType,
                           })
                         }
-                        className="w-full px-2 py-1.5 rounded bg-slate-900 border border-slate-700 text-slate-200"
+                        className="w-full px-2 py-1.5 rounded-sm bg-slate-900 border border-slate-700 text-slate-200"
                       >
                         <option value="chevron">Chevron Pulse</option>
                         <option value="rings">Radial Rings</option>
@@ -611,7 +849,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                               .value as StimulusIntensityLevel,
                           })
                         }
-                        className="w-full px-2 py-1.5 rounded bg-slate-900 border border-slate-700 text-slate-200"
+                        className="w-full px-2 py-1.5 rounded-sm bg-slate-900 border border-slate-700 text-slate-200"
                       >
                         <option value="low">Low</option>
                         <option value="medium">Medium</option>
@@ -621,8 +859,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </div>
                 </div>
 
-                {/* RIGHT DISPLAY CONFIG */}
-                <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3">
+                <div className="bg-slate-950 border border-slate-800 rounded-sm p-4 space-y-3">
                   <div className="flex items-center justify-between">
                     <span className="font-display font-bold text-base text-white">
                       Right Distraction Display
@@ -636,7 +873,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         src={rightQrDataUrl}
                         alt="QR Code for Right Side Display"
                         referrerPolicy="no-referrer"
-                        className="w-24 h-24 rounded-lg border border-slate-700 shrink-0"
+                        className="w-24 h-24 rounded-sm border border-slate-700 shrink-0"
                       />
                     )}
                     <div className="space-y-1.5 min-w-0 flex-1">
@@ -648,20 +885,20 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                         readOnly
                         aria-label="Right Display URL"
                         value={rightDisplayUrl}
-                        className="w-full px-2 py-1 rounded bg-slate-900 border border-slate-800 text-[11px] font-mono-tabular text-slate-200"
+                        className="w-full px-2 py-1 rounded-sm bg-slate-900 border border-slate-800 text-[11px] font-mono-tabular text-slate-200"
                       />
                       <div className="flex gap-1.5">
                         <button
                           type="button"
                           onClick={() => openSideUrl(rightDisplayUrl)}
-                          className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 cursor-pointer"
+                          className="px-2.5 py-1 rounded-sm bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 cursor-pointer"
                         >
                           Open Right Window
                         </button>
                         <button
                           type="button"
                           onClick={() => onTriggerTestStimulus('right')}
-                          className="px-2.5 py-1 rounded bg-sky-500/20 border border-sky-500/50 text-sky-300 text-xs font-semibold cursor-pointer"
+                          className="px-2.5 py-1 rounded-sm bg-sky-500/20 border border-sky-500/50 text-sky-300 text-xs font-semibold cursor-pointer"
                         >
                           Test Right Pulse
                         </button>
@@ -682,7 +919,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                             rightPattern: e.target.value as SidePatternType,
                           })
                         }
-                        className="w-full px-2 py-1.5 rounded bg-slate-900 border border-slate-700 text-slate-200"
+                        className="w-full px-2 py-1.5 rounded-sm bg-slate-900 border border-slate-700 text-slate-200"
                       >
                         <option value="rings">Radial Rings</option>
                         <option value="chevron">Chevron Pulse</option>
@@ -703,7 +940,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                               .value as StimulusIntensityLevel,
                           })
                         }
-                        className="w-full px-2 py-1.5 rounded bg-slate-900 border border-slate-700 text-slate-200"
+                        className="w-full px-2 py-1.5 rounded-sm bg-slate-900 border border-slate-700 text-slate-200"
                       >
                         <option value="low">Low</option>
                         <option value="medium">Medium</option>
@@ -713,29 +950,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   </div>
                 </div>
               </div>
-
-              {/* LAN Deployment Note */}
-              <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-3.5 text-xs text-slate-300">
-                <strong className="text-white">
-                  Multi-Computer / Phone LAN Setup:
-                </strong>{' '}
-                The server binds to <code className="text-amber-300">0.0.0.0:3000</code>.
-                Note that <code className="text-slate-400">localhost</code> on
-                this computer is not accessible from another computer or phone;
-                devices on the same school Wi-Fi/LAN should connect using this
-                machine&apos;s LAN IP address (
-                <code className="text-sky-300">
-                  {networkTelemetry.lanUrls[0] ||
-                    'http://<HOST_LAN_IP>:3000'}
-                </code>
-                ).
-              </div>
             </div>
           )}
 
           {/* 4. CAMERA & ATTENTION MONITORING */}
           {activeTab === 'camera' && (
-            <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-4">
+            <div className="bg-slate-950 border border-slate-800 rounded-sm p-4 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <div className="text-xs font-mono-tabular uppercase text-amber-400 font-semibold">
@@ -752,7 +972,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <button
                     type="button"
                     onClick={() => onToggleWebcam(false)}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer ${
+                    className={`px-3 py-1.5 rounded-sm text-xs font-semibold cursor-pointer ${
                       !webcamActive
                         ? 'bg-amber-500 text-slate-950'
                         : 'bg-slate-900 text-slate-300 border border-slate-700'
@@ -763,7 +983,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <button
                     type="button"
                     onClick={() => onToggleWebcam(true)}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer ${
+                    className={`px-3 py-1.5 rounded-sm text-xs font-semibold cursor-pointer ${
                       webcamActive
                         ? 'bg-emerald-500 text-slate-950'
                         : 'bg-slate-900 text-slate-300 border border-slate-700'
@@ -774,7 +994,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
               </div>
 
-              <div className="text-xs text-slate-300 bg-slate-900/90 border border-slate-800 rounded-lg p-3">
+              <div className="text-xs text-slate-300 bg-slate-900/90 border border-slate-800 rounded-sm p-3">
                 {attention.statusMessage}
               </div>
 
@@ -782,24 +1002,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <button
                   type="button"
                   onClick={onResetPoseCalibration}
-                  className="px-4 py-2 rounded-lg bg-sky-500 hover:bg-sky-400 text-slate-950 font-semibold text-xs cursor-pointer"
+                  className="px-4 py-2 rounded-sm bg-sky-500 hover:bg-sky-400 text-slate-950 font-semibold text-xs cursor-pointer"
                 >
                   Calibrate Neutral Forward Pose Now
                 </button>
               )}
-
-              <p className="text-xs text-slate-400 leading-relaxed">
-                Privacy &amp; Accuracy Note: All webcam frames are processed
-                locally in browser memory and never uploaded or saved. The local
-                tracker estimates head orientation (yaw/pitch) rather than
-                clinical sub-degree pupil eye gaze.
-              </p>
             </div>
           )}
 
           {/* 5. AUDIO */}
           {activeTab === 'audio' && (
-            <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-4">
+            <div className="bg-slate-950 border border-slate-800 rounded-sm p-4 space-y-4">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-mono-tabular uppercase text-slate-400">
                   PROCEDURAL WEB AUDIO SYNTHESIZER MIXER
@@ -809,7 +1022,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   onClick={() =>
                     onUpdateAudioSettings({ muted: !audioSettings.muted })
                   }
-                  className={`px-3 py-1 rounded text-xs font-semibold cursor-pointer ${
+                  className={`px-3 py-1 rounded-sm text-xs font-semibold cursor-pointer ${
                     audioSettings.muted
                       ? 'bg-rose-600 text-white'
                       : 'bg-emerald-500 text-slate-950'
@@ -885,7 +1098,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
           {/* 6. ACCESSIBILITY */}
           {activeTab === 'accessibility' && (
-            <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3 text-xs">
+            <div className="bg-slate-950 border border-slate-800 rounded-sm p-4 space-y-3 text-xs">
               <div className="text-xs font-mono-tabular uppercase text-slate-400 mb-1">
                 VISUAL &amp; MOTION ACCESSIBILITY
               </div>

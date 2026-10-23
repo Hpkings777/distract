@@ -228,7 +228,9 @@ export class ExperimentManager {
 
     const isCurrentlyDistracted =
       attentionState === 'POSSIBLY_DISTRACTED' ||
-      attentionState === 'DISTRACTED';
+      attentionState === 'DISTRACTED' ||
+      attentionState === 'DROWSY_WARNING' ||
+      attentionState === 'DROWSY_CRITICAL';
 
     if (isCurrentlyDistracted) {
       this.totalDistractedTimeSec += dt;

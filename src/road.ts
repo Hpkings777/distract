@@ -1,14 +1,28 @@
-import { ROAD_CONFIG } from './config.ts';
+import {
+  DEFAULT_TRAFFIC_CONFIG,
+  MAP_PRESETS,
+  ROAD_CONFIG,
+  TRAFFIC_DENSITY_COUNTS,
+} from './config.ts';
+import type { MapPreset, TrafficConfig } from './config.ts';
 
 export interface RoadSample {
   s: number;
   centerX: number;
   elevationY: number;
   headingRad: number;
+  pitchRad: number;
   curvature: number;
 }
 
-export type HazardType = 'sedan' | 'suv' | 'truck' | 'work_zone' | 'braking_car';
+export type HazardType =
+  | 'sedan'
+  | 'suv'
+  | 'truck'
+  | 'work_zone'
+  | 'braking_car'
+  | 'coupe'
+  | 'patrol';
 
 export interface RoadHazard {
   id: number;
@@ -17,6 +31,7 @@ export interface RoadHazard {
   laneIndex: 0 | 1; // 0 = left lane (-1.8m), 1 = right lane (+1.8m)
   lateralOffset: number; // meters from road center
   speed: number; // forward speed along road (m/s)
+  baseSpeed: number; // preferred cruise speed (m/s)
   width: number;
   length: number;
   colorHex: number;
@@ -27,41 +42,95 @@ export interface RoadHazard {
   nearMissed: boolean;
   laneChangeTimer?: number;
   targetLateralOffset?: number;
+  turnSignal?: 'none' | 'left' | 'right';
+}
+
+let activeRoadMapPreset: MapPreset = 'alpine';
+
+export function setActiveRoadMapPreset(preset: MapPreset): void {
+  activeRoadMapPreset = preset;
+}
+
+export function getActiveRoadMapPreset(): MapPreset {
+  return activeRoadMapPreset;
 }
 
 /**
- * Deterministic, smooth road centerline generator as a function of arc-length s (meters).
- * Combines gentle highway curves and subtle vertical undulations.
+ * Deterministic, C2-continuous road centerline generator as a function of arc-length s (meters).
+ * Uses zero-origin harmonic waves paired with exact analytical product-rule derivatives
+ * so there is never any sideways warp at the start or normal mismatch on curves.
  */
-export function getRoadSample(s: number): RoadSample {
-  // Keep initial 60m straight so the driver spawns aligned on a clear vista
-  const fade = Math.min(1, Math.max(0, (s - 35) / 50));
-  const k1 = 0.009;
-  const k2 = 0.0042;
-  const k3 = 0.016;
+export function getRoadSample(
+  s: number,
+  mapOverride?: MapPreset,
+): RoadSample {
+  const mapCfg = MAP_PRESETS[mapOverride ?? activeRoadMapPreset];
+  const cScale = mapCfg.curveScale;
+  const eScale = mapCfg.elevationScale;
 
-  const centerX =
-    fade *
-    (Math.sin(s * k1) * 18 +
-      Math.cos(s * k2 - 0.7) * 28 +
-      Math.sin(s * k3 + 1.4) * 6.5);
+  // Smooth C2 quintic ramp from s = 25m to s = 95m so the initial launch corridor is dead straight
+  const rampStart = 25;
+  const rampSpan = 70;
+  const u = Math.min(1, Math.max(0, (s - rampStart) / rampSpan));
+  const u2 = u * u;
+  const u3 = u2 * u;
+  const u4 = u3 * u;
+  const u5 = u4 * u;
 
-  const dxds =
-    fade *
-    (Math.cos(s * k1) * 18 * k1 -
-      Math.sin(s * k2 - 0.7) * 28 * k2 +
-      Math.cos(s * k3 + 1.4) * 6.5 * k3);
+  // Quintic smoothstep: fade(u) = 6u^5 - 15u^4 + 10u^3
+  const fade = 6 * u5 - 15 * u4 + 10 * u3;
+  const dfade =
+    u > 0 && u < 1 ? (30 * u4 - 60 * u3 + 30 * u2) / rampSpan : 0;
+  const d2fade =
+    u > 0 && u < 1
+      ? (120 * u3 - 180 * u2 + 60 * u) / (rampSpan * rampSpan)
+      : 0;
 
-  const d2xds2 =
-    fade *
-    (-Math.sin(s * k1) * 18 * k1 * k1 -
-      Math.cos(s * k2 - 0.7) * 28 * k2 * k2 -
-      Math.sin(s * k3 + 1.4) * 6.5 * k3 * k3);
+  const ds = Math.max(0, s - rampStart);
+  const k1 = 0.0075;
+  const k2 = 0.0038;
+  const k3 = 0.0145;
 
-  const elevationY =
-    fade * (Math.sin(s * 0.0065) * 1.4 + Math.cos(s * 0.013) * 0.55);
+  const a1 = 22.0 * cScale;
+  const a2 = 32.0 * cScale;
+  const a3 = 6.8 * cScale;
+
+  // Pure sine waves anchored at ds = 0 so f(rampStart) === 0
+  const f =
+    Math.sin(ds * k1) * a1 +
+    Math.sin(ds * k2) * a2 +
+    Math.sin(ds * k3) * a3;
+
+  const df =
+    Math.cos(ds * k1) * a1 * k1 +
+    Math.cos(ds * k2) * a2 * k2 +
+    Math.cos(ds * k3) * a3 * k3;
+
+  const d2f =
+    -Math.sin(ds * k1) * a1 * k1 * k1 -
+    Math.sin(ds * k2) * a2 * k2 * k2 -
+    Math.sin(ds * k3) * a3 * k3 * k3;
+
+  // Exact product rule derivatives: X(s) = fade(s) * f(s)
+  const centerX = fade * f;
+  const dxds = fade * df + dfade * f;
+  const d2xds2 = fade * d2f + 2 * dfade * df + d2fade * f;
+
+  // Vertical elevation wave & exact slope derivative dy/ds
+  const ke1 = 0.0058;
+  const ke2 = 0.012;
+  const ae1 = 1.65 * eScale;
+  const ae2 = 0.65 * eScale;
+
+  const fy = Math.sin(ds * ke1) * ae1 + Math.sin(ds * ke2) * ae2;
+  const dfy =
+    Math.cos(ds * ke1) * ae1 * ke1 + Math.cos(ds * ke2) * ae2 * ke2;
+
+  const elevationY = fade * fy;
+  const dyds = fade * dfy + dfade * fy;
 
   const headingRad = Math.atan(dxds);
+  const pitchRad = Math.atan(dyds);
   const curvature = d2xds2;
 
   return {
@@ -69,6 +138,7 @@ export function getRoadSample(s: number): RoadSample {
     centerX: centerX || 0,
     elevationY: elevationY || 0,
     headingRad: headingRad || 0,
+    pitchRad: pitchRad || 0,
     curvature: curvature || 0,
   };
 }
@@ -77,7 +147,10 @@ export function getRoadSample(s: number): RoadSample {
  * Computes lane metrics given vehicle lateral offset from road center.
  * Right lane center is +1.8m, Left lane center is -1.8m.
  */
-export function evaluateLanePosition(lateralOffset: number, targetLane: 0 | 1 = 1) {
+export function evaluateLanePosition(
+  lateralOffset: number,
+  targetLane: 0 | 1 = 1,
+) {
   const targetCenter =
     targetLane === 1
       ? ROAD_CONFIG.playerDefaultLaneOffset
@@ -93,7 +166,8 @@ export function evaluateLanePosition(lateralOffset: number, targetLane: 0 | 1 = 
   const halfRoad = ROAD_CONFIG.totalRoadWidth * 0.5;
   const isOutOfLane = deviationFromTargetLane > ROAD_CONFIG.safeLaneTolerance;
   const isOnShoulder = Math.abs(lateralOffset) > halfRoad - 0.35;
-  const isHittingGuardrail = Math.abs(lateralOffset) >= ROAD_CONFIG.guardrailOffset - 0.6;
+  const isHittingGuardrail =
+    Math.abs(lateralOffset) >= ROAD_CONFIG.guardrailOffset - 0.6;
 
   return {
     targetCenter,
@@ -120,29 +194,55 @@ export function createSeededRng(seed: number): () => number {
 }
 
 const VEHICLE_PALETTE = [
-  0x1e3a8a, // midnight blue metallic
-  0x0284c7, // electric cyan
-  0xd97706, // amber gold metallic
-  0xdc2626, // crimson red
+  0x1e3a8a, // midnight sapphire metallic
+  0x0284c7, // performance cyan metallic
+  0xd97706, // solaris amber gold
+  0xdc2626, // corsa crimson red
   0x059669, // british racing green
-  0x7c3aed, // deep violet
-  0x475569, // nardo slate grey
-  0xf8fafc, // polar pearl white
+  0x475569, // gunmetal titanium
+  0xf8fafc, // championship pearl white
+  0x312e81, // deep indigo metallic
 ];
 
-export function generateInitialHazards(seed = 1042, count = 24): RoadHazard[] {
+export function generateInitialHazards(
+  seed = 1042,
+  count?: number,
+  trafficConfig: TrafficConfig = DEFAULT_TRAFFIC_CONFIG,
+): RoadHazard[] {
+  const effectiveCount =
+    count !== undefined
+      ? count
+      : TRAFFIC_DENSITY_COUNTS[trafficConfig.density];
+
+  if (effectiveCount <= 0) {
+    return [];
+  }
+
   const rng = createSeededRng(seed);
   const hazards: RoadHazard[] = [];
-  let currentS = 68; // First hazard starts 68m ahead so first few seconds are completely clear
+  const spacingScale =
+    trafficConfig.density === 'heavy'
+      ? 0.72
+      : trafficConfig.density === 'light'
+      ? 1.38
+      : 1.0;
 
-  for (let i = 0; i < count; i++) {
+  let currentS = 72; // First vehicle starts 72m ahead so initial launch is 100% clear
+
+  for (let i = 0; i < effectiveCount; i++) {
     const roll = rng();
     let type: HazardType = 'sedan';
-    if (roll < 0.28) type = 'sedan';
-    else if (roll < 0.48) type = 'suv';
-    else if (roll < 0.68) type = 'braking_car';
-    else if (roll < 0.84) type = 'work_zone';
-    else type = 'truck';
+    if (roll < 0.22) type = 'sedan';
+    else if (roll < 0.42) type = 'coupe';
+    else if (roll < 0.60) type = 'suv';
+    else if (roll < 0.76) type = 'braking_car';
+    else if (roll < 0.87) {
+      type = trafficConfig.allowWorkZones ? 'work_zone' : 'patrol';
+    } else if (roll < 0.93) {
+      type = 'patrol';
+    } else {
+      type = 'truck';
+    }
 
     // Alternate lanes with slight bias towards lane 1 (driver's lane)
     const laneIndex: 0 | 1 = i % 3 === 1 ? 0 : 1;
@@ -151,34 +251,43 @@ export function generateInitialHazards(seed = 1042, count = 24): RoadHazard[] {
         ? ROAD_CONFIG.playerDefaultLaneOffset
         : -ROAD_CONFIG.playerDefaultLaneOffset;
 
-    const speed =
+    const speedMult = trafficConfig.speedMultiplier ?? 1.0;
+    const rawSpeed =
       type === 'work_zone'
         ? 0
         : type === 'truck'
-        ? 11.2 + rng() * 2.8
+        ? 11.8 + rng() * 2.6
         : type === 'braking_car'
-        ? 15.5 + rng() * 2.5
+        ? 15.8 + rng() * 2.4
+        : type === 'coupe' || type === 'patrol'
+        ? 16.5 + rng() * 4.2
         : type === 'suv'
-        ? 14.0 + rng() * 3.5
-        : 14.5 + rng() * 4.0;
+        ? 14.5 + rng() * 3.4
+        : 15.0 + rng() * 3.8;
+
+    const speed = type === 'work_zone' ? 0 : rawSpeed * speedMult;
 
     const width =
       type === 'truck'
-        ? 2.35
+        ? 2.38
         : type === 'work_zone'
         ? 2.2
         : type === 'suv'
-        ? 1.95
-        : 1.85;
+        ? 1.98
+        : type === 'coupe'
+        ? 1.92
+        : 1.86;
 
     const length =
       type === 'truck'
-        ? 7.4
+        ? 7.5
         : type === 'work_zone'
-        ? 5.2
+        ? 5.0
         : type === 'suv'
-        ? 4.6
-        : 4.2;
+        ? 4.65
+        : type === 'coupe'
+        ? 4.35
+        : 4.4;
 
     hazards.push({
       id: i + 1,
@@ -187,6 +296,7 @@ export function generateInitialHazards(seed = 1042, count = 24): RoadHazard[] {
       laneIndex,
       lateralOffset,
       speed,
+      baseSpeed: speed,
       width,
       length,
       colorHex: VEHICLE_PALETTE[i % VEHICLE_PALETTE.length],
@@ -195,9 +305,12 @@ export function generateInitialHazards(seed = 1042, count = 24): RoadHazard[] {
       passed: false,
       collided: false,
       nearMissed: false,
+      laneChangeTimer: 0,
+      targetLateralOffset: lateralOffset,
+      turnSignal: 'none',
     });
 
-    currentS += 48 + rng() * 34;
+    currentS += (46 + rng() * 34) * spacingScale;
   }
 
   return hazards;

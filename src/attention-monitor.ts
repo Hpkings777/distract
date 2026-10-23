@@ -2,48 +2,59 @@ import { ATTENTION_CONFIG } from './config.ts';
 import type { AttentionState } from './config.ts';
 
 export interface AttentionObservation {
-  yawDeg: number; // horizontal head turn (+ right, - left)
-  pitchDeg: number; // vertical head pitch (+ down, - up)
-  confidence: number; // 0.0 to 1.0
+  eyesClosed?: boolean;
+  eyeOpenness?: number; // 0.0 (closed) to 1.0 (fully open)
+  confidence: number;
   source: 'simulated' | 'webcam';
   cameraFailed?: boolean;
   failureReason?: string;
+  // Backward-compatible fields
+  yawDeg?: number;
+  pitchDeg?: number;
 }
 
 export interface AttentionSnapshot {
   state: AttentionState;
   mode: 'simulated' | 'webcam';
+  eyesClosed: boolean;
+  eyeOpenness: number;
+  closureDurationMs: number;
+  closureDurationSec: number;
+  thresholdSec: number; // 5.0 seconds
+  emergencySlowdownActive: boolean;
+  confidence: number;
+  statusMessage: string;
+  // Backward compatibility fields
   yawDeg: number;
   pitchDeg: number;
   calibratedYawOffset: number;
   calibratedPitchOffset: number;
-  confidence: number;
   sustainedDeviationMs: number;
-  calibrationProgress: number; // 0..1
-  statusMessage: string;
+  calibrationProgress: number;
+  isOffRoadWarning?: boolean;
 }
 
 /**
- * Modular, replaceable driver attention monitor.
- * Accepts head orientation / gaze observations with timestamps and computes
- * calibrated state transitions with configurable grace periods.
+ * Driver Monitoring System (DMS) for Eye-Closure and Fatigue/Drowsiness.
+ * Tracks continuous eye closure against a strict 5.0-second threshold.
+ * When eyes remain shut >= 5.0s, triggers critical alarm and automatic vehicle slowdown.
  */
 export class AttentionMonitor {
   private state: AttentionState = 'ATTENTIVE';
   private mode: 'simulated' | 'webcam' = 'simulated';
-  private calibratedYaw = 0;
-  private calibratedPitch = 0;
-  private calibrationSamples: Array<{ yaw: number; pitch: number }> = [];
-  private isCalibrating = false;
 
   private lastTimestampMs: number | null = null;
-  private deviationDurationMs = 0;
+  private closureDurationMs = 0;
   private recoveryDurationMs = 0;
 
-  private currentYawDeg = 0;
-  private currentPitchDeg = 0;
+  private currentEyesClosed = false;
+  private currentEyeOpenness = 1.0;
   private currentConfidence = 1.0;
-  private statusMessage = 'Simulated attention monitor ready (Hold L or look at side stimulus)';
+  private statusMessage = 'Driver Monitoring System active — Eyes open';
+
+  // Calibration state for neutral pose
+  private isCalibrating = false;
+  private calibrationSamples: number[] = [];
 
   constructor(initialMode: 'simulated' | 'webcam' = 'simulated') {
     this.mode = initialMode;
@@ -52,16 +63,16 @@ export class AttentionMonitor {
 
   public setMode(mode: 'simulated' | 'webcam'): void {
     this.mode = mode;
-    this.deviationDurationMs = 0;
+    this.closureDurationMs = 0;
     this.recoveryDurationMs = 0;
     this.lastTimestampMs = null;
     if (mode === 'simulated') {
       this.state = 'ATTENTIVE';
       this.currentConfidence = 1.0;
-      this.statusMessage = 'Simulated monitoring active';
+      this.statusMessage = 'Simulated DMS active (Eyes Open)';
     } else {
       this.state = 'INITIALIZING';
-      this.statusMessage = 'Initializing webcam head-pose tracker...';
+      this.statusMessage = 'Connecting webcam Driver Monitoring System...';
     }
   }
 
@@ -69,17 +80,22 @@ export class AttentionMonitor {
     this.calibrationSamples = [];
     this.isCalibrating = true;
     this.state = 'CALIBRATING';
-    this.deviationDurationMs = 0;
-    this.statusMessage = 'Look straight ahead at the road center to calibrate neutral pose...';
+    this.closureDurationMs = 0;
+    this.statusMessage = 'Calibrating baseline ocular exposure...';
   }
 
-  public reportCameraUnavailable(reason = 'Camera permission denied or device unavailable'): void {
+  public reportCameraUnavailable(
+    reason = 'Camera permission denied or device unavailable',
+  ): void {
     this.state = 'CAMERA_UNAVAILABLE';
     this.currentConfidence = 0;
     this.statusMessage = reason;
   }
 
-  public update(observation: AttentionObservation, timestampMs: number): AttentionSnapshot {
+  public update(
+    observation: AttentionObservation,
+    timestampMs: number,
+  ): AttentionSnapshot {
     const dtMs =
       this.lastTimestampMs !== null
         ? Math.max(0, Math.min(250, timestampMs - this.lastTimestampMs))
@@ -97,74 +113,90 @@ export class AttentionMonitor {
 
     this.currentConfidence = observation.confidence;
 
-    // Low confidence check (e.g. face occluded or poor lighting)
-    if (observation.confidence < ATTENTION_CONFIG.minConfidence) {
-      this.statusMessage = 'Low face-tracking confidence — ensure face is evenly lit';
-      return this.getState();
+    // Determine eye closure state:
+    // Either directly from observation.eyesClosed / observation.eyeOpenness,
+    // or from legacy gaze deflection if eyesClosed is not provided.
+    let isClosed = false;
+    if (typeof observation.eyesClosed === 'boolean') {
+      isClosed = observation.eyesClosed;
+      this.currentEyeOpenness =
+        observation.eyeOpenness ?? (isClosed ? 0.05 : 0.95);
+    } else if (typeof observation.eyeOpenness === 'number') {
+      this.currentEyeOpenness = observation.eyeOpenness;
+      isClosed = observation.eyeOpenness < 0.38;
+    } else {
+      // Legacy fallback: head pose deviation
+      const yaw = Math.abs(observation.yawDeg ?? 0);
+      const pitch = Math.abs(observation.pitchDeg ?? 0);
+      isClosed =
+        yaw >= ATTENTION_CONFIG.yawThresholdDeg ||
+        pitch >= ATTENTION_CONFIG.pitchThresholdDeg;
+      this.currentEyeOpenness = isClosed ? 0.1 : 0.95;
     }
 
-    // Handle active neutral-pose calibration
+    this.currentEyesClosed = isClosed;
+
     if (this.isCalibrating) {
-      this.calibrationSamples.push({
-        yaw: observation.yawDeg,
-        pitch: observation.pitchDeg,
-      });
-      if (this.calibrationSamples.length >= ATTENTION_CONFIG.calibrationSamplesRequired) {
-        const sum = this.calibrationSamples.reduce(
-          (acc, s) => ({ yaw: acc.yaw + s.yaw, pitch: acc.pitch + s.pitch }),
-          { yaw: 0, pitch: 0 },
-        );
-        this.calibratedYaw = sum.yaw / this.calibrationSamples.length;
-        this.calibratedPitch = sum.pitch / this.calibrationSamples.length;
+      this.calibrationSamples.push(this.currentEyeOpenness);
+      if (this.calibrationSamples.length >= 10) {
         this.isCalibrating = false;
         this.state = 'ATTENTIVE';
-        this.statusMessage = 'Neutral forward pose calibrated';
+        this.statusMessage = 'DMS Baseline calibrated';
       } else {
         this.state = 'CALIBRATING';
         return this.getState();
       }
     }
 
-    // Compute relative head pose from calibrated neutral center
-    const relYaw = observation.yawDeg - this.calibratedYaw;
-    const relPitch = observation.pitchDeg - this.calibratedPitch;
-    this.currentYawDeg = relYaw;
-    this.currentPitchDeg = relPitch;
+    const thresholdMs = ATTENTION_CONFIG.eyesClosedThresholdSec * 1000; // 5000ms (5s)
 
-    const isLookingAway =
-      Math.abs(relYaw) >= ATTENTION_CONFIG.yawThresholdDeg ||
-      Math.abs(relPitch) >= ATTENTION_CONFIG.pitchThresholdDeg;
-
-    if (isLookingAway) {
-      this.deviationDurationMs += dtMs;
+    if (isClosed) {
+      this.closureDurationMs += dtMs;
       this.recoveryDurationMs = 0;
 
-      if (this.deviationDurationMs >= ATTENTION_CONFIG.distractedDelayMs) {
-        this.state = 'DISTRACTED';
-        this.statusMessage = 'Sustained visual distraction detected — Eyes on road!';
-      } else if (this.deviationDurationMs >= ATTENTION_CONFIG.possiblyDistractedDelayMs) {
-        this.state = 'POSSIBLY_DISTRACTED';
-        this.statusMessage = 'Head pose deviating from road center...';
+      if (this.closureDurationMs >= thresholdMs) {
+        // Critical threshold crossed (>= 5.0 seconds closed)
+        this.state = 'DROWSY_CRITICAL';
+        this.statusMessage = `DROWSINESS DETECTED: EYES CLOSED ${(
+          this.closureDurationMs / 1000
+        ).toFixed(1)}s (>${
+          ATTENTION_CONFIG.eyesClosedThresholdSec
+        }s) — EMERGENCY VEHICLE SLOWDOWN ENGAGED!`;
+      } else if (
+        this.closureDurationMs >= ATTENTION_CONFIG.eyesClosedWarningDelayMs
+      ) {
+        // Warning countdown zone (0.4s to 4.9s)
+        this.state = 'DROWSY_WARNING';
+        const remainingSec = Math.max(
+          0,
+          (thresholdMs - this.closureDurationMs) / 1000,
+        );
+        this.statusMessage = `EYES CLOSED ${(
+          this.closureDurationMs / 1000
+        ).toFixed(1)}s — 5s THRESHOLD IN ${remainingSec.toFixed(1)}s`;
       } else {
-        // Within short grace period to prevent false alarms from brief glances
-        if (this.state !== 'DISTRACTED' && this.state !== 'POSSIBLY_DISTRACTED') {
+        // Brief natural blink grace period (<400ms)
+        if (this.state !== 'DROWSY_CRITICAL') {
           this.state = 'ATTENTIVE';
         }
       }
     } else {
-      // Looking forward
-      if (this.state === 'DISTRACTED' || this.state === 'POSSIBLY_DISTRACTED') {
+      // Eyes are open: clear closure timer & restore attentive state
+      if (this.state === 'DROWSY_CRITICAL') {
         this.recoveryDurationMs += dtMs;
-        if (this.recoveryDurationMs >= ATTENTION_CONFIG.recoveryGraceMs) {
+        // Fast 150ms confirmation to disengage emergency alert
+        if (this.recoveryDurationMs >= 150) {
           this.state = 'ATTENTIVE';
-          this.deviationDurationMs = 0;
+          this.closureDurationMs = 0;
           this.recoveryDurationMs = 0;
-          this.statusMessage = 'Driver attentive — Forward roadway aligned';
+          this.statusMessage =
+            'Driver alert — Eyes reopened, vehicle control restored';
         }
       } else {
         this.state = 'ATTENTIVE';
-        this.deviationDurationMs = Math.max(0, this.deviationDurationMs - dtMs * 2);
-        this.statusMessage = 'Driver attentive — Forward roadway aligned';
+        this.closureDurationMs = 0;
+        this.recoveryDurationMs = 0;
+        this.statusMessage = 'Driver attentive — Forward roadway monitored';
       }
     }
 
@@ -172,24 +204,33 @@ export class AttentionMonitor {
   }
 
   public getState(): AttentionSnapshot {
-    const progress = this.isCalibrating
-      ? Math.min(
-          1,
-          this.calibrationSamples.length / ATTENTION_CONFIG.calibrationSamplesRequired,
-        )
-      : 1;
+    const isCritical = this.state === 'DROWSY_CRITICAL';
+    const isWarning = this.state === 'DROWSY_WARNING' || isCritical;
 
     return {
       state: this.state,
       mode: this.mode,
-      yawDeg: this.currentYawDeg,
-      pitchDeg: this.currentPitchDeg,
-      calibratedYawOffset: this.calibratedYaw,
-      calibratedPitchOffset: this.calibratedPitch,
+      eyesClosed: this.currentEyesClosed,
+      eyeOpenness: this.currentEyeOpenness,
+      closureDurationMs: this.closureDurationMs,
+      closureDurationSec: Number((this.closureDurationMs / 1000).toFixed(2)),
+      thresholdSec: ATTENTION_CONFIG.eyesClosedThresholdSec, // 5.0
+      emergencySlowdownActive:
+        this.closureDurationMs >=
+        ATTENTION_CONFIG.eyesClosedThresholdSec * 1000,
       confidence: this.currentConfidence,
-      sustainedDeviationMs: this.deviationDurationMs,
-      calibrationProgress: progress,
       statusMessage: this.statusMessage,
+      // Backward-compatibility properties
+      yawDeg: this.currentEyesClosed ? 22 : 0,
+      pitchDeg: this.currentEyesClosed ? 18 : 0,
+      calibratedYawOffset: 0,
+      calibratedPitchOffset: 0,
+      sustainedDeviationMs: this.closureDurationMs,
+      calibrationProgress: this.isCalibrating ? 0.5 : 1.0,
+      isOffRoadWarning: isWarning,
     };
   }
 }
+
+// Backward-compatible alias
+export const DriverDrowsinessMonitor = AttentionMonitor;

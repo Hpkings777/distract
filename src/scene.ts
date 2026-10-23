@@ -2,18 +2,29 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import {
   LIGHTING_PRESETS,
+  MAP_PRESETS,
   QUALITY_PRESETS,
   ROAD_CONFIG,
 } from './config.ts';
 import type {
   AttentionState,
+  CameraViewMode,
   LightingPreset,
+  MapPreset,
   QualityPreset,
 } from './config.ts';
-import { getRoadSample } from './road.ts';
+import { getRoadSample, setActiveRoadMapPreset } from './road.ts';
 import type { RoadHazard } from './road.ts';
 import { getInterpolatedVehiclePose } from './vehicle.ts';
-import type { VehicleState } from './vehicle.ts';
+import type { StepCollisionEvent, VehicleState } from './vehicle.ts';
+import { ParticleEngine } from './particles.ts';
+import {
+  buildCompositeHazardGroup,
+  buildPlayerHeroCar,
+  createRoadAsphaltTexture,
+  createUrbanSkyscraperTexture,
+} from './assets3d.ts';
+import type { BuiltVehicleNode } from './assets3d.ts';
 
 // Pre-allocated scratch math objects to prevent GC in the render loop
 const _mat4 = new THREE.Matrix4();
@@ -22,6 +33,7 @@ const _quat = new THREE.Quaternion();
 const _euler = new THREE.Euler();
 const _scale = new THREE.Vector3();
 const _lookTarget = new THREE.Vector3();
+const _targetCamPos = new THREE.Vector3();
 
 export interface RendererDiagnostics {
   activeBackend: string;
@@ -31,476 +43,8 @@ export interface RendererDiagnostics {
   fps: number;
   qualityPreset: QualityPreset;
   lightingPreset: LightingPreset;
-}
-
-import { ParticleEngine } from './particles.ts';
-import type { StepCollisionEvent } from './vehicle.ts';
-
-function createRoadAsphaltTexture(maxAnisotropy: number): THREE.CanvasTexture {
-  const canvas = document.createElement('canvas');
-  canvas.width = 1024;
-  canvas.height = 1024;
-  const ctx = canvas.getContext('2d')!;
-
-  // 1. Deep realistic dark asphalt base
-  ctx.fillStyle = '#181e28';
-  ctx.fillRect(0, 0, 1024, 1024);
-
-  // 2. Micro aggregate stone specks
-  for (let i = 0; i < 18000; i++) {
-    const x = (i * 79) % 1024;
-    const y = (i * 157) % 1024;
-    const v = 26 + ((i * 31) % 24);
-    ctx.fillStyle = `rgb(${v}, ${v + 4}, ${v + 9})`;
-    ctx.fillRect(x, y, 2, 2);
-  }
-
-  // 3. Dark tar crack sealant lines
-  ctx.strokeStyle = '#0f141c';
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(180, 0);
-  ctx.bezierCurveTo(220, 280, 140, 680, 210, 1024);
-  ctx.stroke();
-
-  ctx.beginPath();
-  ctx.moveTo(760, 0);
-  ctx.bezierCurveTo(720, 320, 810, 720, 750, 1024);
-  ctx.stroke();
-
-  // 4. Paved shoulders (left & right)
-  ctx.fillStyle = '#263140';
-  ctx.fillRect(0, 0, 112, 1024);
-  ctx.fillRect(912, 0, 112, 1024);
-
-  // 5. Corrugated warning rumble strips
-  for (let y = 0; y < 1024; y += 48) {
-    ctx.fillStyle = y % 96 === 0 ? '#f59e0b' : '#1e293b';
-    ctx.fillRect(80, y, 32, 28);
-    ctx.fillRect(912, y, 32, 28);
-  }
-
-  // 6. Solid outer reflective white road edge lines
-  ctx.fillStyle = '#f8fafc';
-  ctx.fillRect(116, 0, 16, 1024);
-  ctx.fillRect(892, 0, 16, 1024);
-
-  // 7. Center double yellow highway divider + passing dash
-  for (let y = 0; y < 1024; y += 96) {
-    ctx.fillStyle = '#fbbf24';
-    ctx.fillRect(504, y + 10, 16, 56);
-    // Reflective cat's eye road stud with silver housing & crystal
-    ctx.fillStyle = '#94a3b8';
-    ctx.fillRect(507, y + 74, 10, 10);
-    ctx.fillStyle = '#fef08a';
-    ctx.fillRect(509, y + 76, 6, 6);
-  }
-
-  // 8. Pronounced dark rubber braking skid marks
-  ctx.fillStyle = 'rgba(10, 15, 24, 0.45)';
-  // Left lane tire paths
-  ctx.fillRect(230, 0, 44, 1024);
-  ctx.fillRect(350, 0, 44, 1024);
-  // Right lane tire paths
-  ctx.fillRect(630, 0, 44, 1024);
-  ctx.fillRect(750, 0, 44, 1024);
-
-  // Heavy emergency braking skid marks in right lane
-  ctx.fillStyle = 'rgba(7, 10, 18, 0.65)';
-  ctx.beginPath();
-  ctx.moveTo(638, 180);
-  ctx.quadraticCurveTo(644, 450, 656, 780);
-  ctx.lineTo(670, 780);
-  ctx.quadraticCurveTo(658, 450, 652, 180);
-  ctx.fill();
-
-  ctx.beginPath();
-  ctx.moveTo(758, 180);
-  ctx.quadraticCurveTo(764, 450, 776, 780);
-  ctx.lineTo(790, 780);
-  ctx.quadraticCurveTo(778, 450, 772, 180);
-  ctx.fill();
-
-  // 9. Painted speed stencil "80" on right lane asphalt
-  ctx.fillStyle = 'rgba(248, 250, 252, 0.28)';
-  ctx.font = 'bold 120px monospace';
-  ctx.fillText('80', 660, 560);
-
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  texture.wrapS = THREE.RepeatWrapping;
-  texture.wrapT = THREE.RepeatWrapping;
-  texture.anisotropy = maxAnisotropy;
-  return texture;
-}
-
-function buildCompositeHazardGroup(
-  hazard: RoadHazard,
-  colorblindSafe = false,
-): {
-  group: THREE.Group;
-  brakeLights: THREE.Mesh[];
-  beaconLight?: THREE.Mesh;
-} {
-  const group = new THREE.Group();
-  const brakeLights: THREE.Mesh[] = [];
-
-  if (hazard.type === 'work_zone') {
-    // High-visibility Construction Work Zone Barrier Trailer & Arrow Board
-    const orangeMat = new THREE.MeshStandardMaterial({
-      color: 0xf97316,
-      roughness: 0.45,
-      metalness: 0.15,
-    });
-    const whiteStripeMat = new THREE.MeshStandardMaterial({
-      color: 0xf8fafc,
-      roughness: 0.3,
-      metalness: 0.2,
-    });
-    const steelMat = new THREE.MeshStandardMaterial({
-      color: 0x334155,
-      roughness: 0.5,
-      metalness: 0.75,
-    });
-
-    // 1. Trailer chassis & wheels
-    const trailerBase = new THREE.Mesh(new THREE.BoxGeometry(2.1, 0.35, 3.6), steelMat);
-    trailerBase.position.set(0, 0.42, 0);
-    group.add(trailerBase);
-
-    const wheelGeo = new THREE.CylinderGeometry(0.36, 0.36, 0.22, 12);
-    wheelGeo.rotateZ(Math.PI / 2);
-    const wheelMat = new THREE.MeshStandardMaterial({ color: 0x090d16, roughness: 0.85 });
-    const wL = new THREE.Mesh(wheelGeo, wheelMat);
-    wL.position.set(-1.12, 0.36, 0);
-    const wR = new THREE.Mesh(wheelGeo, wheelMat);
-    wR.position.set(1.12, 0.36, 0);
-    group.add(wL, wR);
-
-    // 2. High-visibility Orange & White Barricade Boards
-    const barGeo = new THREE.BoxGeometry(2.05, 0.24, 0.08);
-    for (let b = 0; b < 3; b++) {
-      const bar = new THREE.Mesh(barGeo, b % 2 === 0 ? orangeMat : whiteStripeMat);
-      bar.position.set(0, 0.85 + b * 0.32, -1.2);
-      group.add(bar);
-    }
-
-    // 3. Illuminated LED Directional Arrow Board
-    const boardFrame = new THREE.Mesh(new THREE.BoxGeometry(1.9, 1.25, 0.16), steelMat);
-    boardFrame.position.set(0, 2.2, 0.3);
-    group.add(boardFrame);
-
-    const beaconMat = new THREE.MeshStandardMaterial({
-      color: 0xfbbf24,
-      emissive: 0xf59e0b,
-      emissiveIntensity: 2.2,
-      roughness: 0.2,
-    });
-
-    // Sequential Arrow LED matrix indicators
-    for (let col = -3; col <= 3; col++) {
-      const led = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.08, 0.08, 0.1, 8),
-        beaconMat,
-      );
-      led.rotation.x = Math.PI / 2;
-      led.position.set(col * 0.24, 2.2, 0.39);
-      group.add(led);
-    }
-
-    // Top dual flashing beacon lights
-    const beaconTopL = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.14, 0.14, 0.22, 10),
-      beaconMat,
-    );
-    beaconTopL.position.set(-0.75, 2.95, 0.3);
-    const beaconTopR = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.14, 0.14, 0.22, 10),
-      beaconMat.clone(),
-    );
-    beaconTopR.position.set(0.75, 2.95, 0.3);
-    group.add(beaconTopL, beaconTopR);
-
-    // 4. Weighted reflective construction barrels & cones on approach
-    const barrelGeo = new THREE.CylinderGeometry(0.3, 0.32, 0.95, 12);
-    const barrel = new THREE.Mesh(barrelGeo, orangeMat);
-    barrel.position.set(hazard.laneIndex === 1 ? -0.85 : 0.85, 0.475, -2.4);
-    const barrelStripe = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.305, 0.315, 0.28, 12),
-      whiteStripeMat,
-    );
-    barrelStripe.position.set(0, 0.12, 0);
-    barrel.add(barrelStripe);
-    group.add(barrel);
-
-    return { group, brakeLights, beaconLight: beaconTopL };
-  }
-
-  const isTruck = hazard.type === 'truck';
-  const bodyColor =
-    hazard.type === 'braking_car'
-      ? colorblindSafe
-        ? 0xf59e0b
-        : 0xf43f5e
-      : hazard.colorHex;
-
-  const hullMat = new THREE.MeshStandardMaterial({
-    color: bodyColor,
-    roughness: 0.24,
-    metalness: 0.65,
-  });
-  const glassMat = new THREE.MeshStandardMaterial({
-    color: 0x0f172a,
-    roughness: 0.1,
-    metalness: 0.9,
-  });
-  const trimMat = new THREE.MeshStandardMaterial({
-    color: 0x1e293b,
-    roughness: 0.7,
-    metalness: 0.3,
-  });
-  const chromeMat = new THREE.MeshStandardMaterial({
-    color: 0xe2e8f0,
-    roughness: 0.15,
-    metalness: 0.95,
-  });
-  const tireRubberMat = new THREE.MeshStandardMaterial({
-    color: 0x090d16,
-    roughness: 0.9,
-    metalness: 0.05,
-  });
-  const rimAlloyMat = new THREE.MeshStandardMaterial({
-    color: 0x94a3b8,
-    roughness: 0.25,
-    metalness: 0.85,
-  });
-  const headlightMat = new THREE.MeshStandardMaterial({
-    color: 0xffffff,
-    emissive: 0xe0f2fe,
-    emissiveIntensity: 1.8,
-    roughness: 0.15,
-  });
-  const brakeMat = new THREE.MeshStandardMaterial({
-    color: 0xef4444,
-    emissive: 0xef4444,
-    emissiveIntensity: 1.1,
-    roughness: 0.2,
-  });
-
-  if (isTruck) {
-    // -------------------------------------------------------------------------
-    // Heavy Commercial Box Delivery Truck with Reflective Chevron Safety Tape
-    // -------------------------------------------------------------------------
-    // 1. Aerodynamic Cab Chassis
-    const cab = new THREE.Mesh(new THREE.BoxGeometry(2.18, 1.95, 1.9), hullMat);
-    cab.position.set(0, 1.35, 2.75);
-    group.add(cab);
-
-    // Cab windshield & side windows
-    const cabWindshield = new THREE.Mesh(new THREE.BoxGeometry(2.06, 0.85, 0.15), glassMat);
-    cabWindshield.position.set(0, 1.65, 3.72);
-    cabWindshield.rotation.x = -0.15;
-    group.add(cabWindshield);
-
-    // Front Chrome Bumper & Grille
-    const frontBumper = new THREE.Mesh(new THREE.BoxGeometry(2.26, 0.42, 0.45), chromeMat);
-    frontBumper.position.set(0, 0.45, 3.75);
-    group.add(frontBumper);
-
-    // Dual Headlights
-    const hL = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.2, 0.1), headlightMat);
-    hL.position.set(-0.85, 0.52, 3.98);
-    const hR = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.2, 0.1), headlightMat);
-    hR.position.set(0.85, 0.52, 3.98);
-    group.add(hL, hR);
-
-    // 2. High-Capacity Cargo Box
-    const cargoBox = new THREE.Mesh(
-      new THREE.BoxGeometry(2.32, 2.55, 5.3),
-      new THREE.MeshStandardMaterial({
-        color: 0xf1f5f9,
-        roughness: 0.45,
-        metalness: 0.2,
-      }),
-    );
-    cargoBox.position.set(0, 1.72, -0.65);
-    group.add(cargoBox);
-
-    // Rear Safety Chevron Hazard Panel (Yellow & Black Stripes)
-    const chevronCanvas = document.createElement('canvas');
-    chevronCanvas.width = 256;
-    chevronCanvas.height = 128;
-    const cctx = chevronCanvas.getContext('2d')!;
-    cctx.fillStyle = '#fbbf24';
-    cctx.fillRect(0, 0, 256, 128);
-    cctx.fillStyle = '#0f172a';
-    for (let x = -64; x < 320; x += 48) {
-      cctx.beginPath();
-      cctx.moveTo(x, 128);
-      cctx.lineTo(x + 32, 128);
-      cctx.lineTo(x + 56, 0);
-      cctx.lineTo(x + 24, 0);
-      cctx.fill();
-    }
-    const chevronTex = new THREE.CanvasTexture(chevronCanvas);
-    const chevronMat = new THREE.MeshStandardMaterial({
-      map: chevronTex,
-      roughness: 0.4,
-    });
-    const chevronMesh = new THREE.Mesh(new THREE.PlaneGeometry(2.28, 0.65), chevronMat);
-    chevronMesh.position.set(0, 0.62, -3.32);
-    chevronMesh.rotation.y = Math.PI;
-    group.add(chevronMesh);
-
-    // Side diesel fuel tanks & boarding steps
-    const fuelTankGeo = new THREE.CylinderGeometry(0.28, 0.28, 1.4, 12);
-    fuelTankGeo.rotateX(Math.PI / 2);
-    const tankL = new THREE.Mesh(fuelTankGeo, chromeMat);
-    tankL.position.set(-1.12, 0.45, 1.1);
-    const tankR = new THREE.Mesh(fuelTankGeo, chromeMat);
-    tankR.position.set(1.12, 0.45, 1.1);
-    group.add(tankL, tankR);
-
-    // Heavy dual wheels (6 wheels total: 2 front, 4 dual rear)
-    const tireGeo = new THREE.CylinderGeometry(0.42, 0.42, 0.28, 14);
-    tireGeo.rotateZ(Math.PI / 2);
-    const rimGeo = new THREE.CylinderGeometry(0.24, 0.24, 0.29, 10);
-    rimGeo.rotateZ(Math.PI / 2);
-
-    const wheelSpecs = [
-      [-1.08, 0.42, 2.6],
-      [1.08, 0.42, 2.6],
-      [-1.12, 0.42, -1.8],
-      [1.12, 0.42, -1.8],
-      [-1.12, 0.42, -2.6],
-      [1.12, 0.42, -2.6],
-    ];
-    for (const [wx, wy, wz] of wheelSpecs) {
-      const tire = new THREE.Mesh(tireGeo, tireRubberMat);
-      tire.position.set(wx, wy, wz);
-      const rim = new THREE.Mesh(rimGeo, rimAlloyMat);
-      tire.add(rim);
-      group.add(tire);
-    }
-  } else {
-    // -------------------------------------------------------------------------
-    // Sleek Sports Sedan with Aerodynamic Profile, Grille & Alloy Rims
-    // -------------------------------------------------------------------------
-    // 1. Lower Body Chassis
-    const lowerBody = new THREE.Mesh(
-      new THREE.BoxGeometry(1.84, 0.52, 4.2),
-      hullMat,
-    );
-    lowerBody.position.set(0, 0.5, 0);
-    group.add(lowerBody);
-
-    // 2. Sculpted Hood & Trunk Wedge
-    const hoodCrease = new THREE.Mesh(
-      new THREE.BoxGeometry(1.68, 0.14, 1.5),
-      hullMat,
-    );
-    hoodCrease.position.set(0, 0.74, 1.25);
-    hoodCrease.rotation.x = -0.06;
-    group.add(hoodCrease);
-
-    // 3. Cabin Greenhouse (Windshield, Roof, Windows)
-    const cabin = new THREE.Mesh(
-      new THREE.BoxGeometry(1.52, 0.58, 2.15),
-      glassMat,
-    );
-    cabin.position.set(0, 1.05, -0.15);
-    group.add(cabin);
-
-    // Sleek Roof Panel in matching body paint
-    const roof = new THREE.Mesh(new THREE.BoxGeometry(1.42, 0.05, 1.6), hullMat);
-    roof.position.set(0, 1.35, -0.18);
-    group.add(roof);
-
-    // 4. Front Radiator Grille & Diffuser
-    const grille = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.22, 0.05), trimMat);
-    grille.position.set(0, 0.48, 2.12);
-    group.add(grille);
-
-    // Dual Projector Headlights
-    const hL = new THREE.Mesh(new THREE.BoxGeometry(0.38, 0.14, 0.08), headlightMat);
-    hL.position.set(-0.68, 0.58, 2.11);
-    const hR = new THREE.Mesh(new THREE.BoxGeometry(0.38, 0.14, 0.08), headlightMat);
-    hR.position.set(0.68, 0.58, 2.11);
-    group.add(hL, hR);
-
-    // Side Exterior Mirrors
-    const mirrorGeo = new THREE.BoxGeometry(0.18, 0.1, 0.12);
-    const mirL = new THREE.Mesh(mirrorGeo, trimMat);
-    mirL.position.set(-0.96, 0.98, 0.65);
-    const mirR = new THREE.Mesh(mirrorGeo, trimMat);
-    mirR.position.set(0.96, 0.98, 0.65);
-    group.add(mirL, mirR);
-
-    // 5. High-Detail Wheels with 5-Spoke Alloy Rims
-    const tireGeo = new THREE.CylinderGeometry(0.33, 0.33, 0.24, 14);
-    tireGeo.rotateZ(Math.PI / 2);
-    const rimGeo = new THREE.CylinderGeometry(0.2, 0.2, 0.25, 8);
-    rimGeo.rotateZ(Math.PI / 2);
-
-    const wheelOffsets = [
-      [-0.88, 0.33, -1.3],
-      [0.88, 0.33, -1.3],
-      [-0.88, 0.33, 1.3],
-      [0.88, 0.33, 1.3],
-    ];
-    for (const [wx, wy, wz] of wheelOffsets) {
-      const tire = new THREE.Mesh(tireGeo, tireRubberMat);
-      tire.position.set(wx, wy, wz);
-      const rim = new THREE.Mesh(rimGeo, rimAlloyMat);
-      tire.add(rim);
-      group.add(tire);
-    }
-
-    // Rear Bumper Diffuser & Dual Chrome Exhaust Tips
-    const diffuser = new THREE.Mesh(new THREE.BoxGeometry(1.68, 0.16, 0.1), trimMat);
-    diffuser.position.set(0, 0.28, -2.11);
-    group.add(diffuser);
-
-    const tipGeo = new THREE.CylinderGeometry(0.05, 0.05, 0.12, 8);
-    tipGeo.rotateX(Math.PI / 2);
-    const tipL = new THREE.Mesh(tipGeo, chromeMat);
-    tipL.position.set(-0.52, 0.27, -2.15);
-    const tipR = new THREE.Mesh(tipGeo, chromeMat);
-    tipR.position.set(0.52, 0.27, -2.15);
-    group.add(tipL, tipR);
-  }
-
-  // Dual Wide Red LED Taillights / Brake Lights
-  const tailZ = isTruck ? -3.32 : -2.11;
-  const tailY = isTruck ? 0.88 : 0.65;
-  const leftBrake = new THREE.Mesh(
-    new THREE.BoxGeometry(isTruck ? 0.42 : 0.44, 0.16, 0.08),
-    brakeMat.clone(),
-  );
-  leftBrake.position.set(-0.68, tailY, tailZ);
-  const rightBrake = new THREE.Mesh(
-    new THREE.BoxGeometry(isTruck ? 0.42 : 0.44, 0.16, 0.08),
-    brakeMat.clone(),
-  );
-  rightBrake.position.set(0.68, tailY, tailZ);
-  group.add(leftBrake, rightBrake);
-  brakeLights.push(leftBrake, rightBrake);
-
-  // Soft Ambient Contact Shadow Under Vehicle
-  const shadowDisc = new THREE.Mesh(
-    new THREE.PlaneGeometry(isTruck ? 2.6 : 2.1, isTruck ? 7.8 : 4.6),
-    new THREE.MeshBasicMaterial({
-      color: 0x020617,
-      transparent: true,
-      opacity: 0.55,
-      depthWrite: false,
-    }),
-  );
-  shadowDisc.rotation.x = -Math.PI / 2;
-  shadowDisc.position.set(0, 0.02, 0);
-  group.add(shadowDisc);
-
-  return { group, brakeLights };
+  mapPreset?: MapPreset;
+  cameraView?: CameraViewMode;
 }
 
 function buildHighwayGantry(title: string, sub: string): {
@@ -510,54 +54,61 @@ function buildHighwayGantry(title: string, sub: string): {
   const group = new THREE.Group();
   const trussMat = new THREE.MeshStandardMaterial({
     color: 0x64748b,
-    roughness: 0.45,
-    metalness: 0.8,
+    roughness: 0.42,
+    metalness: 0.82,
   });
 
   // Vertical steel support columns safely behind left & right guardrails
-  const colGeo = new THREE.CylinderGeometry(0.18, 0.22, 6.8, 8);
+  const colGeo = new THREE.CylinderGeometry(0.2, 0.24, 7.0, 10);
   const leftCol = new THREE.Mesh(colGeo, trussMat);
-  leftCol.position.set(-6.8, 3.4, 0);
+  leftCol.position.set(-6.8, 3.5, 0);
   const rightCol = new THREE.Mesh(colGeo, trussMat);
-  rightCol.position.set(6.8, 3.4, 0);
+  rightCol.position.set(6.8, 3.5, 0);
   group.add(leftCol, rightCol);
 
-  // Horizontal overhead truss beam spanning across both lanes
-  const beam = new THREE.Mesh(new THREE.BoxGeometry(14.4, 0.55, 0.65), trussMat);
-  beam.position.set(0, 6.2, 0);
-  group.add(beam);
+  // Horizontal overhead dual-chord truss beam spanning across both lanes
+  const beamUpper = new THREE.Mesh(
+    new THREE.BoxGeometry(14.4, 0.28, 0.55),
+    trussMat,
+  );
+  beamUpper.position.set(0, 6.5, 0);
+  const beamLower = new THREE.Mesh(
+    new THREE.BoxGeometry(14.4, 0.28, 0.55),
+    trussMat,
+  );
+  beamLower.position.set(0, 5.85, 0);
+  group.add(beamUpper, beamLower);
 
-  // Highway green guide sign with canvas texture
+  // Highway green guide sign with crisp canvas typography
   const signCanvas = document.createElement('canvas');
   signCanvas.width = 512;
   signCanvas.height = 160;
   const ctx = signCanvas.getContext('2d')!;
-  ctx.fillStyle = '#15803d'; // interstate green
+  ctx.fillStyle = '#0f5132';
   ctx.fillRect(0, 0, 512, 160);
   ctx.strokeStyle = '#f8fafc';
   ctx.lineWidth = 6;
   ctx.strokeRect(6, 6, 500, 148);
 
   ctx.fillStyle = '#ffffff';
-  ctx.font = 'bold 36px monospace';
+  ctx.font = 'bold 34px monospace';
   ctx.textAlign = 'center';
-  ctx.fillText(title, 256, 65);
-  ctx.font = 'bold 24px sans-serif';
-  ctx.fillStyle = '#fef08a';
-  ctx.fillText(sub, 256, 115);
+  ctx.fillText(title, 256, 64);
+  ctx.font = 'bold 22px sans-serif';
+  ctx.fillStyle = '#fde047';
+  ctx.fillText(sub, 256, 114);
 
   const signTex = new THREE.CanvasTexture(signCanvas);
   signTex.colorSpace = THREE.SRGBColorSpace;
   const signMat = new THREE.MeshStandardMaterial({
     map: signTex,
-    roughness: 0.35,
-    metalness: 0.1,
+    roughness: 0.32,
+    metalness: 0.12,
   });
-  const signMesh = new THREE.Mesh(new THREE.PlaneGeometry(6.4, 2.0), signMat);
-  signMesh.position.set(0, 5.7, 0.35);
+  const signMesh = new THREE.Mesh(new THREE.PlaneGeometry(6.6, 2.05), signMat);
+  signMesh.position.set(0, 6.1, 0.32);
   group.add(signMesh);
 
-  // Warning amber beacons
   const warningBeacons: THREE.Mesh[] = [];
   const beaconMat = new THREE.MeshStandardMaterial({
     color: 0xfbbf24,
@@ -568,12 +119,12 @@ function buildHighwayGantry(title: string, sub: string): {
     new THREE.CylinderGeometry(0.18, 0.18, 0.28, 8),
     beaconMat,
   );
-  beacon1.position.set(-3.1, 6.8, 0.35);
+  beacon1.position.set(-3.2, 7.0, 0.32);
   const beacon2 = new THREE.Mesh(
     new THREE.CylinderGeometry(0.18, 0.18, 0.28, 8),
     beaconMat.clone(),
   );
-  beacon2.position.set(3.1, 6.8, 0.35);
+  beacon2.position.set(3.2, 7.0, 0.32);
   group.add(beacon1, beacon2);
   warningBeacons.push(beacon1, beacon2);
 
@@ -584,38 +135,44 @@ function buildOverpassBridge(): THREE.Group {
   const group = new THREE.Group();
   const concreteMat = new THREE.MeshStandardMaterial({
     color: 0x94a3b8,
-    roughness: 0.85,
-    metalness: 0.1,
+    roughness: 0.82,
+    metalness: 0.12,
   });
-  const asphaltMat = new THREE.MeshStandardMaterial({
-    color: 0x1e293b,
-    roughness: 0.7,
+  const steelParapetMat = new THREE.MeshStandardMaterial({
+    color: 0x475569,
+    roughness: 0.45,
+    metalness: 0.75,
   });
 
-  // Elevated deck spanning across road at 7.2m height
-  const deck = new THREE.Mesh(new THREE.BoxGeometry(24, 1.4, 8.5), concreteMat);
-  deck.position.set(0, 7.2, 0);
+  // Elevated box-girder deck spanning across road at 7.4m height
+  const deck = new THREE.Mesh(
+    new THREE.BoxGeometry(28, 1.35, 8.8),
+    concreteMat,
+  );
+  deck.position.set(0, 7.4, 0);
   group.add(deck);
 
-  const topRoad = new THREE.Mesh(
-    new THREE.BoxGeometry(23.8, 0.1, 8.0),
-    asphaltMat,
+  const railNorth = new THREE.Mesh(
+    new THREE.BoxGeometry(28, 0.45, 0.25),
+    steelParapetMat,
   );
-  topRoad.position.set(0, 7.95, 0);
-  group.add(topRoad);
+  railNorth.position.set(0, 8.3, 4.25);
+  const railSouth = new THREE.Mesh(
+    new THREE.BoxGeometry(28, 0.45, 0.25),
+    steelParapetMat,
+  );
+  railSouth.position.set(0, 8.3, -4.25);
+  group.add(railNorth, railSouth);
 
-  // Dual concrete pillars safely placed beyond road shoulder & guardrail
-  const pillarGeo = new THREE.BoxGeometry(1.2, 6.8, 1.4);
-  const leftPillar1 = new THREE.Mesh(pillarGeo, concreteMat);
-  leftPillar1.position.set(-8.2, 3.4, -2.5);
-  const leftPillar2 = new THREE.Mesh(pillarGeo, concreteMat);
-  leftPillar2.position.set(-8.2, 3.4, 2.5);
-
-  const rightPillar1 = new THREE.Mesh(pillarGeo, concreteMat);
-  rightPillar1.position.set(8.2, 3.4, -2.5);
-  const rightPillar2 = new THREE.Mesh(pillarGeo, concreteMat);
-  rightPillar2.position.set(8.2, 3.4, 2.5);
-  group.add(leftPillar1, leftPillar2, rightPillar1, rightPillar2);
+  // Dual concrete piers safely placed beyond road shoulder & guardrail (at ±8.6m)
+  const pillarGeo = new THREE.BoxGeometry(1.3, 8.8, 1.5);
+  for (const px of [-8.6, 8.6]) {
+    for (const pz of [-2.6, 2.6]) {
+      const pier = new THREE.Mesh(pillarGeo, concreteMat);
+      pier.position.set(px, 3.2, pz);
+      group.add(pier);
+    }
+  }
 
   return group;
 }
@@ -625,20 +182,32 @@ export class DrivingSceneRenderer {
   private renderer: THREE.WebGLRenderer;
   private scene: THREE.Scene;
   private camera: THREE.PerspectiveCamera;
-  private isHeadless: boolean;
+  private isSoftwareGl: boolean;
 
   private qualityPreset: QualityPreset = 'balanced';
   private lightingPreset: LightingPreset = 'dusk';
+  private mapPreset: MapPreset = 'alpine';
+  private cameraView: CameraViewMode = 'cockpit';
   private webgpuSupported = false;
   private smoothedFrameTimeMs = 16.6;
 
   private hemiLight: THREE.HemisphereLight;
   private sunLight: THREE.DirectionalLight;
+  private headlightSpot: THREE.SpotLight;
+  private headlightTarget: THREE.Object3D;
   private fog: THREE.FogExp2;
 
   private roadGeometry: THREE.BufferGeometry;
   private roadMesh: THREE.Mesh;
+  private roadMaterial: THREE.MeshStandardMaterial;
   private roadTexture: THREE.CanvasTexture;
+
+  // Road-following terrain skirt & embankment mesh (never intersects road elevation!)
+  private terrainGeometry: THREE.BufferGeometry;
+  private terrainMesh: THREE.Mesh;
+  private terrainMaterial: THREE.MeshStandardMaterial;
+  private waterMesh: THREE.Mesh;
+  private vistaPeakMat: THREE.MeshStandardMaterial;
 
   private particleEngine: ParticleEngine;
   private leftPostsInstanced: THREE.InstancedMesh;
@@ -646,11 +215,14 @@ export class DrivingSceneRenderer {
   private leftGuardrailsInstanced: THREE.InstancedMesh;
   private rightGuardrailsInstanced: THREE.InstancedMesh;
   private lamppostsInstanced: THREE.InstancedMesh;
+  private lampHeadsInstanced: THREE.InstancedMesh;
   private treesTrunksInstanced: THREE.InstancedMesh;
   private treesCanopyInstanced: THREE.InstancedMesh;
   private autumnTreesTrunksInstanced: THREE.InstancedMesh;
   private autumnTreesCanopyInstanced: THREE.InstancedMesh;
   private bouldersInstanced: THREE.InstancedMesh;
+  private urbanTowersInstanced: THREE.InstancedMesh;
+  private desertMesasInstanced: THREE.InstancedMesh;
 
   private highwayGantries: Array<{
     group: THREE.Group;
@@ -659,11 +231,11 @@ export class DrivingSceneRenderer {
   }> = [];
   private overpassBridges: Array<{ group: THREE.Group; spacingS: number }> = [];
 
+  private playerHeroCar: BuiltVehicleNode;
   private cockpitRig: THREE.Group;
   private steeringWheelGroup: THREE.Group;
   private dashWarningStripMat: THREE.MeshStandardMaterial;
   private dashLaneBarMesh: THREE.Mesh;
-  private headlightsGroup: THREE.Group;
 
   // Live 2D canvas instrument screen inside 3D dashboard binnacle
   private dashScreenCanvas: HTMLCanvasElement;
@@ -671,33 +243,40 @@ export class DrivingSceneRenderer {
   private dashScreenTexture: THREE.CanvasTexture;
   private lastDashDrawTime = 0;
 
-  private hazardNodes = new Map<
-    number,
-    {
-      group: THREE.Group;
-      brakeLights: THREE.Mesh[];
-      beaconLight?: THREE.Mesh;
-    }
-  >();
+  private hazardNodes = new Map<number, BuiltVehicleNode>();
 
   private smoothedHeadYawRad = 0;
   private smoothedHeadPitchRad = 0;
+  private smoothedCamOffset = new THREE.Vector3(0, 1.22, 0);
+  private smoothedLookAheadDist = 28;
+  private cameraInitialized = false;
   private resizeObserver: ResizeObserver;
 
   constructor(
     container: HTMLElement,
     initialPreset: QualityPreset = 'balanced',
     initialLighting: LightingPreset = 'dusk',
+    initialMap: MapPreset = 'alpine',
   ) {
     this.container = container;
     this.qualityPreset = initialPreset;
     this.lightingPreset = initialLighting;
+    this.mapPreset = initialMap;
+    setActiveRoadMapPreset(initialMap);
 
-    this.isHeadless =
-      typeof navigator !== 'undefined' &&
-      (navigator.webdriver || /HeadlessChrome/i.test(navigator.userAgent));
+    // Detect software WebGL per threejs skill specification
+    this.isSoftwareGl = (() => {
+      if (typeof document === 'undefined') return true;
+      const probeCanvas = document.createElement('canvas');
+      const gl = probeCanvas.getContext('webgl2');
+      if (!gl) return true;
+      const ext = gl.getExtension('WEBGL_debug_renderer_info');
+      const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
+      const gpu = String(gl.getParameter(param));
+      gl.getExtension('WEBGL_lose_context')?.loseContext();
+      return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
+    })();
 
-    // Probe WebGPU adapter capability for accurate graphics backend diagnostics
     if (typeof navigator !== 'undefined' && 'gpu' in navigator) {
       try {
         const gpu = (
@@ -720,24 +299,25 @@ export class DrivingSceneRenderer {
 
     const preset = QUALITY_PRESETS[initialPreset];
     const lightCfg = LIGHTING_PRESETS[initialLighting];
+    const mapCfg = MAP_PRESETS[initialMap];
 
     this.renderer = new THREE.WebGLRenderer({
-      antialias: this.isHeadless ? false : preset.antialias,
+      antialias: this.isSoftwareGl ? false : preset.antialias,
       powerPreference: 'high-performance',
     });
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.12;
+    this.renderer.toneMappingExposure = 1.14;
 
     const width = Math.max(1, container.clientWidth || window.innerWidth);
     const height = Math.max(1, container.clientHeight || window.innerHeight);
     this.renderer.setSize(width, height);
     this.renderer.setPixelRatio(
-      this.isHeadless
+      this.isSoftwareGl
         ? 1
         : Math.min(window.devicePixelRatio || 1, preset.maxPixelRatio),
     );
-    this.renderer.shadowMap.enabled = !this.isHeadless && preset.shadows;
+    this.renderer.shadowMap.enabled = !this.isSoftwareGl && preset.shadows;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
     this.renderer.domElement.setAttribute('data-testid', 'driving-canvas');
@@ -757,7 +337,7 @@ export class DrivingSceneRenderer {
     ).texture;
     pmrem.dispose();
 
-    this.camera = new THREE.PerspectiveCamera(64, width / height, 0.1, 320);
+    this.camera = new THREE.PerspectiveCamera(64, width / height, 0.12, 340);
 
     this.hemiLight = new THREE.HemisphereLight(
       lightCfg.hemiSkyHex,
@@ -770,42 +350,68 @@ export class DrivingSceneRenderer {
       lightCfg.sunHex,
       lightCfg.sunIntensity,
     );
-    this.sunLight.position.set(35, 65, -45);
+    this.sunLight.position.set(40, 72, -50);
     this.scene.add(this.sunLight);
 
-    // Ground terrain plane
-    const groundGeo = new THREE.PlaneGeometry(1600, 1600);
-    groundGeo.rotateX(-Math.PI / 2);
-    const groundMat = new THREE.MeshStandardMaterial({
-      color: 0x0b1320,
+    // Real 3D Headlight SpotLight (never clips or phases through road surface)
+    this.headlightSpot = new THREE.SpotLight(
+      0xe0f2fe,
+      lightCfg.headlightsActive ? 4.5 : 0,
+      95,
+      Math.PI / 4.2,
+      0.55,
+      1.2,
+    );
+    this.headlightTarget = new THREE.Object3D();
+    this.scene.add(this.headlightSpot, this.headlightTarget);
+    this.headlightSpot.target = this.headlightTarget;
+
+    // Deep horizon floor safely 24m below road so it NEVER intersects valleys
+    const deepFloorGeo = new THREE.PlaneGeometry(2400, 2400);
+    deepFloorGeo.rotateX(-Math.PI / 2);
+    const deepFloorMat = new THREE.MeshStandardMaterial({
+      color: mapCfg.terrainColorHex,
       roughness: 0.95,
       metalness: 0.05,
     });
-    const groundMesh = new THREE.Mesh(groundGeo, groundMat);
-    groundMesh.position.y = -0.25;
-    this.scene.add(groundMesh);
+    const deepFloorMesh = new THREE.Mesh(deepFloorGeo, deepFloorMat);
+    deepFloorMesh.position.y = -24.0;
+    this.scene.add(deepFloorMesh);
+    this.camera.userData.deepFloorMesh = deepFloorMesh;
 
-    // Horizon mountain silhouette range
+    // Coastal / Bay Ocean Water Plane on Left Embankment (at y = -6.5m, well below any road dip)
+    const waterGeo = new THREE.PlaneGeometry(900, 1800);
+    waterGeo.rotateX(-Math.PI / 2);
+    const waterMat = new THREE.MeshStandardMaterial({
+      color: 0x0369a1,
+      roughness: 0.18,
+      metalness: 0.82,
+    });
+    this.waterMesh = new THREE.Mesh(waterGeo, waterMat);
+    this.waterMesh.position.set(-465, -6.5, 0);
+    this.waterMesh.visible = mapCfg.waterEnabled;
+    this.scene.add(this.waterMesh);
+
+    // Horizon mountain / mesa silhouette range
     const vistaGroup = new THREE.Group();
-    const peakMat = new THREE.MeshStandardMaterial({
-      color: 0x162238,
-      roughness: 0.9,
+    this.vistaPeakMat = new THREE.MeshStandardMaterial({
+      color: mapCfg.vistaColorHex,
+      roughness: 0.88,
       metalness: 0.1,
     });
-    for (let i = -6; i <= 6; i++) {
-      const h = 28 + Math.abs(Math.sin(i * 1.7)) * 38;
+    for (let i = -7; i <= 7; i++) {
+      const h = 34 + Math.abs(Math.sin(i * 1.7)) * 44;
       const peak = new THREE.Mesh(
-        new THREE.ConeGeometry(34 + (i % 3) * 10, h, 5),
-        peakMat,
+        new THREE.ConeGeometry(38 + (i % 3) * 12, h, 5),
+        this.vistaPeakMat,
       );
-      peak.position.set(i * 42, h * 0.45 - 2, -230 - Math.abs(i) * 8);
+      peak.position.set(i * 44, h * 0.42 - 4, -255 - Math.abs(i) * 8);
       vistaGroup.add(peak);
     }
     this.scene.add(vistaGroup);
     this.camera.userData.vistaGroup = vistaGroup;
-    this.camera.userData.groundMesh = groundMesh;
 
-    // Dynamic curved road ribbon geometry
+    // 1. Dynamic Curved Road Ribbon Geometry
     const segs = ROAD_CONFIG.visibleSegments;
     this.roadGeometry = new THREE.BufferGeometry();
     const positions = new Float32Array((segs + 1) * 2 * 3);
@@ -827,51 +433,139 @@ export class DrivingSceneRenderer {
     this.roadGeometry.setIndex(indices);
 
     const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
-    this.roadTexture = createRoadAsphaltTexture(maxAniso);
-    const roadMat = new THREE.MeshStandardMaterial({
+    this.roadTexture = createRoadAsphaltTexture(maxAniso, initialMap);
+    this.roadMaterial = new THREE.MeshStandardMaterial({
       map: this.roadTexture,
       color: 0xffffff,
-      roughness: 0.68,
-      metalness: 0.14,
+      roughness: 0.64,
+      metalness: 0.16,
     });
-    this.roadMesh = new THREE.Mesh(this.roadGeometry, roadMat);
+    this.roadMesh = new THREE.Mesh(this.roadGeometry, this.roadMaterial);
     this.roadMesh.frustumCulled = false;
     this.scene.add(this.roadMesh);
 
-    // Instanced roadside reflector posts
+    // 2. Road-Hugging Terrain Skirt & Embankment Geometry (6 columns per row: left vista -> left berm -> road left -> road right -> right berm -> right vista)
+    // Guarantees the ground follows every hill and valley of the road without ever poking through!
+    this.terrainGeometry = new THREE.BufferGeometry();
+    const tCols = 6;
+    const tPositions = new Float32Array((segs + 1) * tCols * 3);
+    const tIndices: number[] = [];
+    for (let i = 0; i < segs; i++) {
+      const rowA = i * tCols;
+      const rowB = (i + 1) * tCols;
+      // Left terrain strips (cols 0-1, 1-2) and Right terrain strips (cols 3-4, 4-5)
+      // Note: we also bridge 2-3 slightly below the road (-0.18m) so there is never any seam gap
+      for (let col = 0; col < tCols - 1; col++) {
+        const a = rowA + col;
+        const b = rowA + col + 1;
+        const c = rowB + col;
+        const d = rowB + col + 1;
+        tIndices.push(a, b, c, b, d, c);
+      }
+    }
+    this.terrainGeometry.setAttribute(
+      'position',
+      new THREE.BufferAttribute(tPositions, 3),
+    );
+    this.terrainGeometry.setIndex(tIndices);
+    this.terrainMaterial = new THREE.MeshStandardMaterial({
+      color: mapCfg.terrainColorHex,
+      roughness: 0.92,
+      metalness: 0.06,
+    });
+    this.terrainMesh = new THREE.Mesh(
+      this.terrainGeometry,
+      this.terrainMaterial,
+    );
+    this.terrainMesh.frustumCulled = false;
+    this.scene.add(this.terrainMesh);
+
+    // 3. Instanced Roadside Reflector Posts & Continuous W-Beam Guardrails
     const postGeo = new THREE.BoxGeometry(0.14, 0.85, 0.14);
     const leftPostMat = new THREE.MeshStandardMaterial({
       color: 0xf8fafc,
       emissive: 0x38bdf8,
-      emissiveIntensity: 0.5,
+      emissiveIntensity: 0.6,
       roughness: 0.3,
     });
     const rightPostMat = new THREE.MeshStandardMaterial({
       color: 0xf8fafc,
       emissive: 0xf59e0b,
-      emissiveIntensity: 0.5,
+      emissiveIntensity: 0.6,
       roughness: 0.3,
     });
-    this.leftPostsInstanced = new THREE.InstancedMesh(postGeo, leftPostMat, 45);
+    this.leftPostsInstanced = new THREE.InstancedMesh(postGeo, leftPostMat, 48);
     this.rightPostsInstanced = new THREE.InstancedMesh(
       postGeo,
       rightPostMat,
-      45,
+      48,
     );
     this.leftPostsInstanced.frustumCulled = false;
     this.rightPostsInstanced.frustumCulled = false;
     this.scene.add(this.leftPostsInstanced, this.rightPostsInstanced);
 
-    // Instanced roadside pine trees
+    const guardrailGeo = new THREE.BoxGeometry(0.14, 0.38, 8.15);
+    const guardrailMat = new THREE.MeshStandardMaterial({
+      color: 0xcbd5e1,
+      roughness: 0.32,
+      metalness: 0.86,
+    });
+    this.leftGuardrailsInstanced = new THREE.InstancedMesh(
+      guardrailGeo,
+      guardrailMat,
+      48,
+    );
+    this.rightGuardrailsInstanced = new THREE.InstancedMesh(
+      guardrailGeo,
+      guardrailMat,
+      48,
+    );
+    this.leftGuardrailsInstanced.frustumCulled = false;
+    this.rightGuardrailsInstanced.frustumCulled = false;
+    this.scene.add(
+      this.leftGuardrailsInstanced,
+      this.rightGuardrailsInstanced,
+    );
+
+    // 4. Highway Street Light Poles & Glowing LED Luminaires
+    const poleMat = new THREE.MeshStandardMaterial({
+      color: 0x475569,
+      roughness: 0.38,
+      metalness: 0.78,
+    });
+    const lamppostGeo = new THREE.CylinderGeometry(0.09, 0.14, 6.6, 8);
+    this.lamppostsInstanced = new THREE.InstancedMesh(
+      lamppostGeo,
+      poleMat,
+      32,
+    );
+    this.lamppostsInstanced.frustumCulled = false;
+
+    const lampHeadGeo = new THREE.BoxGeometry(0.95, 0.12, 0.32);
+    const lampHeadMat = new THREE.MeshStandardMaterial({
+      color: 0xfef08a,
+      emissive: 0xfef08a,
+      emissiveIntensity: 1.8,
+      roughness: 0.2,
+    });
+    this.lampHeadsInstanced = new THREE.InstancedMesh(
+      lampHeadGeo,
+      lampHeadMat,
+      32,
+    );
+    this.lampHeadsInstanced.frustumCulled = false;
+    this.scene.add(this.lamppostsInstanced, this.lampHeadsInstanced);
+
+    // 5. Instanced Roadside Pine & Birch Trees
     const treeCount = 80;
-    const trunkGeo = new THREE.CylinderGeometry(0.22, 0.32, 1.6, 7);
+    const trunkGeo = new THREE.CylinderGeometry(0.22, 0.34, 1.8, 7);
     const trunkMat = new THREE.MeshStandardMaterial({
       color: 0x3f2e21,
       roughness: 0.9,
     });
-    const canopyGeo = new THREE.ConeGeometry(1.55, 4.2, 7);
+    const canopyGeo = new THREE.ConeGeometry(1.65, 4.5, 7);
     const canopyMat = new THREE.MeshStandardMaterial({
-      color: 0x153e35,
+      color: 0x144336,
       roughness: 0.75,
     });
     this.treesTrunksInstanced = new THREE.InstancedMesh(
@@ -888,58 +582,15 @@ export class DrivingSceneRenderer {
     this.treesCanopyInstanced.frustumCulled = false;
     this.scene.add(this.treesTrunksInstanced, this.treesCanopyInstanced);
 
-    // Particle Engine for collisions, metal sparks, and tire smoke
-    this.particleEngine = new ParticleEngine(this.scene);
-
-    // Continuous 3D W-Beam Corrugated Guardrails (Left & Right)
-    const guardrailGeo = new THREE.BoxGeometry(0.12, 0.42, 4.2);
-    const guardrailMat = new THREE.MeshStandardMaterial({
-      color: 0xcbd5e1,
-      roughness: 0.35,
-      metalness: 0.85,
-    });
-    this.leftGuardrailsInstanced = new THREE.InstancedMesh(
-      guardrailGeo,
-      guardrailMat,
-      45,
-    );
-    this.rightGuardrailsInstanced = new THREE.InstancedMesh(
-      guardrailGeo,
-      guardrailMat,
-      45,
-    );
-    this.leftGuardrailsInstanced.frustumCulled = false;
-    this.rightGuardrailsInstanced.frustumCulled = false;
-    this.scene.add(
-      this.leftGuardrailsInstanced,
-      this.rightGuardrailsInstanced,
-    );
-
-    // Highway Street Light Poles / Lampposts (curved steel masts along shoulder)
-    const poleMat = new THREE.MeshStandardMaterial({
-      color: 0x475569,
-      roughness: 0.4,
-      metalness: 0.75,
-    });
-    const lamppostGeo = new THREE.CylinderGeometry(0.09, 0.13, 6.4, 8);
-    this.lamppostsInstanced = new THREE.InstancedMesh(
-      lamppostGeo,
-      poleMat,
-      30,
-    );
-    this.lamppostsInstanced.frustumCulled = false;
-    this.scene.add(this.lamppostsInstanced);
-
-    // Golden Autumn Birch Trees (rich roadside botanical variety)
     const autumnTreeCount = 45;
-    const birchTrunkGeo = new THREE.CylinderGeometry(0.18, 0.25, 2.2, 7);
+    const birchTrunkGeo = new THREE.CylinderGeometry(0.18, 0.26, 2.2, 7);
     const birchTrunkMat = new THREE.MeshStandardMaterial({
       color: 0xe2e8f0,
       roughness: 0.85,
     });
-    const autumnCanopyGeo = new THREE.DodecahedronGeometry(1.95, 1);
+    const autumnCanopyGeo = new THREE.DodecahedronGeometry(2.0, 1);
     const autumnCanopyMat = new THREE.MeshStandardMaterial({
-      color: 0xf59e0b,
+      color: 0xd97706,
       roughness: 0.7,
     });
     this.autumnTreesTrunksInstanced = new THREE.InstancedMesh(
@@ -959,8 +610,8 @@ export class DrivingSceneRenderer {
       this.autumnTreesCanopyInstanced,
     );
 
-    // Roadside Granite Boulders / Embankment Rocks
-    const boulderGeo = new THREE.DodecahedronGeometry(1.2, 0);
+    // 6. Roadside Granite Boulders
+    const boulderGeo = new THREE.DodecahedronGeometry(1.35, 0);
     const boulderMat = new THREE.MeshStandardMaterial({
       color: 0x475569,
       roughness: 0.88,
@@ -969,16 +620,47 @@ export class DrivingSceneRenderer {
     this.bouldersInstanced = new THREE.InstancedMesh(
       boulderGeo,
       boulderMat,
-      35,
+      36,
     );
     this.bouldersInstanced.frustumCulled = false;
     this.scene.add(this.bouldersInstanced);
 
-    // Overhead Highway Sign Gantries (3 interactive portal truss bridges)
+    // 7. Urban High-Rise Skyscrapers (visible on 'urban' Metro Bay map)
+    const towerGeo = new THREE.BoxGeometry(10, 42, 10);
+    const towerMat = new THREE.MeshStandardMaterial({
+      map: createUrbanSkyscraperTexture(),
+      roughness: 0.35,
+      metalness: 0.5,
+    });
+    this.urbanTowersInstanced = new THREE.InstancedMesh(
+      towerGeo,
+      towerMat,
+      36,
+    );
+    this.urbanTowersInstanced.frustumCulled = false;
+    this.urbanTowersInstanced.visible = mapCfg.urbanBuildings;
+    this.scene.add(this.urbanTowersInstanced);
+
+    // 8. Desert Sandstone Mesas & Monoliths (visible on 'desert' Red Rock map)
+    const mesaGeo = new THREE.CylinderGeometry(4.5, 8.2, 18, 7);
+    const mesaMat = new THREE.MeshStandardMaterial({
+      color: 0x9a3412,
+      roughness: 0.92,
+      metalness: 0.08,
+    });
+    this.desertMesasInstanced = new THREE.InstancedMesh(mesaGeo, mesaMat, 30);
+    this.desertMesasInstanced.frustumCulled = false;
+    this.desertMesasInstanced.visible = mapCfg.desertMesas;
+    this.scene.add(this.desertMesasInstanced);
+
+    // Particle Engine for collisions, metal sparks, and tire smoke
+    this.particleEngine = new ParticleEngine(this.scene);
+
+    // Overhead Highway Sign Gantries
     const gantryConfigs = [
-      { title: 'EXIT 14 · SAFETY CORRIDOR', sub: 'SPEED LIMIT 80 KM/H · RADAR' },
-      { title: 'DISTRACTION STUDY ZONE', sub: 'STAY IN LANE · EYES ON ROAD' },
-      { title: 'ROAD SAFETY LAB · EXHIBITION', sub: 'OBJECTIVE REACTION TESTING' },
+      { title: 'SECTOR 14 · EXPRESS CORRIDOR', sub: 'CRUISE 80 KM/H · RADAR ACTIVE' },
+      { title: 'ATTENTION TELEMETRY ZONE', sub: 'MAINTAIN LANE DISCIPLINE' },
+      { title: 'AUTOMOTIVE SAFETY PROVING GROUND', sub: 'LIVE KINEMATIC TRACKING' },
     ];
     for (let i = 0; i < 3; i++) {
       const g = buildHighwayGantry(
@@ -987,13 +669,13 @@ export class DrivingSceneRenderer {
       );
       this.highwayGantries.push({
         group: g.group,
-        spacingS: 120 + i * 160,
+        spacingS: 120 + i * 165,
         warningBeacons: g.warningBeacons,
       });
       this.scene.add(g.group);
     }
 
-    // Concrete Overpass Flyover Bridges (2 bridges overhead)
+    // Concrete Overpass Flyover Bridges
     for (let i = 0; i < 2; i++) {
       const bridge = buildOverpassBridge();
       this.overpassBridges.push({
@@ -1002,6 +684,10 @@ export class DrivingSceneRenderer {
       });
       this.scene.add(bridge);
     }
+
+    // Build Player Hero GT Sports Coupe (visible in Title Showcase, Chase Cam, and Hood Cam)
+    this.playerHeroCar = buildPlayerHeroCar();
+    this.scene.add(this.playerHeroCar.group);
 
     // Live 2D canvas texture for diegetic 3D instrument binnacle
     this.dashScreenCanvas = document.createElement('canvas');
@@ -1016,17 +702,16 @@ export class DrivingSceneRenderer {
       steeringWheelGroup,
       dashWarningStripMat,
       dashLaneBarMesh,
-      headlightsGroup,
     } = this.createDriverCockpitRig();
     this.cockpitRig = cockpitRig;
     this.steeringWheelGroup = steeringWheelGroup;
     this.dashWarningStripMat = dashWarningStripMat;
     this.dashLaneBarMesh = dashLaneBarMesh;
-    this.headlightsGroup = headlightsGroup;
-    this.headlightsGroup.visible = lightCfg.headlightsActive;
     this.scene.add(this.cockpitRig);
 
-    this.renderer.compile(this.scene, this.camera);
+    if (!this.isSoftwareGl) {
+      this.renderer.compile(this.scene, this.camera);
+    }
 
     this.resizeObserver = new ResizeObserver(() => this.handleResize());
     this.resizeObserver.observe(this.container);
@@ -1036,33 +721,35 @@ export class DrivingSceneRenderer {
     const cockpitRig = new THREE.Group();
 
     const dashMat = new THREE.MeshStandardMaterial({
-      color: 0x0f172a,
-      roughness: 0.65,
-      metalness: 0.25,
+      color: 0x0b101b,
+      roughness: 0.58,
+      metalness: 0.28,
     });
     const cowlMat = new THREE.MeshStandardMaterial({
-      color: 0x1e293b,
-      roughness: 0.4,
-      metalness: 0.45,
+      color: 0x161f30,
+      roughness: 0.36,
+      metalness: 0.48,
     });
-    const hoodMat = new THREE.MeshStandardMaterial({
+    const hoodMat = new THREE.MeshPhysicalMaterial({
       color: 0x0284c7,
-      roughness: 0.24,
-      metalness: 0.72,
+      roughness: 0.18,
+      metalness: 0.78,
+      clearcoat: 1.0,
+      clearcoatRoughness: 0.08,
     });
 
-    // 1. Sculpted front hood
+    // 1. Sculpted aerodynamic front hood
     const hood = new THREE.Mesh(
-      new THREE.BoxGeometry(1.72, 0.14, 1.35),
+      new THREE.BoxGeometry(1.74, 0.12, 1.38),
       hoodMat,
     );
-    hood.position.set(0, -0.44, -1.45);
+    hood.position.set(0, -0.45, -1.42);
     hood.rotation.x = 0.06;
     cockpitRig.add(hood);
 
-    // 2. Main dashboard deck
+    // 2. Main carbon/alcantara dashboard deck
     const dashDeck = new THREE.Mesh(
-      new THREE.BoxGeometry(1.85, 0.24, 0.62),
+      new THREE.BoxGeometry(1.86, 0.24, 0.62),
       dashMat,
     );
     dashDeck.position.set(0, -0.46, -0.72);
@@ -1070,15 +757,15 @@ export class DrivingSceneRenderer {
 
     // 3. Sleek low-profile instrument binnacle hood
     const binnacle = new THREE.Mesh(
-      new THREE.BoxGeometry(0.56, 0.12, 0.3),
+      new THREE.BoxGeometry(0.58, 0.125, 0.3),
       cowlMat,
     );
     binnacle.position.set(0, -0.34, -0.68);
     cockpitRig.add(binnacle);
 
-    // 3b. Digital Gauge Screen mounted on front face of binnacle
+    // 3b. Digital OLED Gauge Screen mounted on front face of binnacle
     const screenPlane = new THREE.Mesh(
-      new THREE.PlaneGeometry(0.48, 0.095),
+      new THREE.PlaneGeometry(0.5, 0.098),
       new THREE.MeshBasicMaterial({ map: this.dashScreenTexture }),
     );
     screenPlane.position.set(0, -0.335, -0.528);
@@ -1092,7 +779,7 @@ export class DrivingSceneRenderer {
       roughness: 0.2,
     });
     const warningStrip = new THREE.Mesh(
-      new THREE.BoxGeometry(1.4, 0.016, 0.03),
+      new THREE.BoxGeometry(1.42, 0.015, 0.028),
       dashWarningStripMat,
     );
     warningStrip.position.set(0, -0.33, -0.88);
@@ -1100,14 +787,14 @@ export class DrivingSceneRenderer {
 
     // 5. Diegetic lane-keeping indicator bar on binnacle top
     const dashLaneBarMesh = new THREE.Mesh(
-      new THREE.BoxGeometry(0.14, 0.02, 0.02),
+      new THREE.BoxGeometry(0.14, 0.018, 0.02),
       new THREE.MeshStandardMaterial({
         color: 0x38bdf8,
         emissive: 0x38bdf8,
         emissiveIntensity: 0.9,
       }),
     );
-    dashLaneBarMesh.position.set(0, -0.275, -0.53);
+    dashLaneBarMesh.position.set(0, -0.274, -0.53);
     cockpitRig.add(dashLaneBarMesh);
 
     // 6. Left & Right Windshield A-Pillars
@@ -1123,7 +810,7 @@ export class DrivingSceneRenderer {
     rightPillar.rotation.x = -0.35;
     cockpitRig.add(leftPillar, rightPillar);
 
-    // 6b. Interior Rear-View Mirror & Exterior Side Mirrors
+    // 7. Interior Rear-View Mirror
     const mirrorFrameMat = new THREE.MeshStandardMaterial({
       color: 0x090d16,
       roughness: 0.5,
@@ -1138,55 +825,38 @@ export class DrivingSceneRenderer {
       new THREE.CylinderGeometry(0.012, 0.012, 0.1, 8),
       mirrorFrameMat,
     );
-    rearMirrorStem.position.set(0, 0.34, -0.58);
+    rearMirrorStem.position.set(0, 0.35, -0.58);
     const rearMirrorHousing = new THREE.Mesh(
       new THREE.BoxGeometry(0.32, 0.068, 0.025),
       mirrorFrameMat,
     );
-    rearMirrorHousing.position.set(0, 0.285, -0.58);
+    rearMirrorHousing.position.set(0, 0.295, -0.58);
     const rearMirrorGlass = new THREE.Mesh(
       new THREE.PlaneGeometry(0.295, 0.052),
       mirrorGlassMat,
     );
-    rearMirrorGlass.position.set(0, 0.285, -0.566);
+    rearMirrorGlass.position.set(0, 0.295, -0.566);
     cockpitRig.add(rearMirrorStem, rearMirrorHousing, rearMirrorGlass);
 
-    // 7. Ground-projected headlight beams on asphalt ahead (visible in dusk & night presets)
-    const headlightsGroup = new THREE.Group();
-    const beamMat = new THREE.MeshBasicMaterial({
-      color: 0xe0f2fe,
-      transparent: true,
-      opacity: 0.06,
-      depthWrite: false,
-    });
-    const beamGeo = new THREE.PlaneGeometry(2.6, 22);
-    beamGeo.rotateX(-Math.PI / 2);
-    const leftBeam = new THREE.Mesh(beamGeo, beamMat);
-    leftBeam.position.set(-0.85, -1.12, -13.5);
-    const rightBeam = new THREE.Mesh(beamGeo, beamMat);
-    rightBeam.position.set(0.85, -1.12, -13.5);
-    headlightsGroup.add(leftBeam, rightBeam);
-    cockpitRig.add(headlightsGroup);
-
-    // 8. Multi-part 3D Steering Wheel Group
+    // 8. Multi-part 3D GT Sport Steering Wheel Group
     const steeringWheelGroup = new THREE.Group();
     steeringWheelGroup.position.set(0, -0.31, -0.46);
     steeringWheelGroup.rotation.x = 0.32;
 
     const rimMat = new THREE.MeshStandardMaterial({
       color: 0x0f172a,
-      roughness: 0.45,
-      metalness: 0.3,
+      roughness: 0.42,
+      metalness: 0.32,
     });
     const spokeMat = new THREE.MeshStandardMaterial({
       color: 0x64748b,
-      roughness: 0.28,
-      metalness: 0.8,
+      roughness: 0.24,
+      metalness: 0.85,
     });
     const centerMarkMat = new THREE.MeshStandardMaterial({
       color: 0xf59e0b,
       emissive: 0xf59e0b,
-      emissiveIntensity: 0.4,
+      emissiveIntensity: 0.45,
       roughness: 0.3,
     });
 
@@ -1228,7 +898,6 @@ export class DrivingSceneRenderer {
       steeringWheelGroup,
       dashWarningStripMat,
       dashLaneBarMesh,
-      headlightsGroup,
     };
   }
 
@@ -1237,10 +906,9 @@ export class DrivingSceneRenderer {
     attentionState: AttentionState,
   ): void {
     const ctx = this.dashScreenCtx;
-    ctx.fillStyle = '#060a12';
+    ctx.fillStyle = '#05080f';
     ctx.fillRect(0, 0, 256, 96);
 
-    // Subtle top border bar
     ctx.fillStyle =
       attentionState === 'DISTRACTED'
         ? '#ef4444'
@@ -1249,25 +917,22 @@ export class DrivingSceneRenderer {
         : '#0ea5e9';
     ctx.fillRect(0, 0, 256, 4);
 
-    // Speed readout inside 3D cluster
     const speedKmh = Math.round(vehicle.speed * 3.6);
     ctx.fillStyle = '#f8fafc';
-    ctx.font = 'bold 34px monospace';
-    ctx.fillText(`${speedKmh}`, 18, 46);
+    ctx.font = 'bold 36px monospace';
+    ctx.fillText(`${speedKmh}`, 18, 48);
     ctx.fillStyle = '#94a3b8';
     ctx.font = 'bold 11px sans-serif';
-    ctx.fillText('KM/H', 82, 44);
+    ctx.fillText('KM/H', 86, 46);
 
-    // Gear badge
     ctx.fillStyle = '#f59e0b';
-    ctx.font = 'bold 22px monospace';
-    ctx.fillText(`D${vehicle.gear}`, 196, 42);
+    ctx.font = 'bold 24px monospace';
+    ctx.fillText(`G${vehicle.gear}`, 196, 44);
 
-    // RPM progress bar at bottom of binnacle screen
     ctx.fillStyle = '#1e293b';
-    ctx.fillRect(18, 64, 220, 12);
+    ctx.fillRect(18, 66, 220, 12);
     ctx.fillStyle = vehicle.rpmNormalized > 0.85 ? '#ef4444' : '#38bdf8';
-    ctx.fillRect(18, 64, Math.round(220 * vehicle.rpmNormalized), 12);
+    ctx.fillRect(18, 66, Math.round(220 * vehicle.rpmNormalized), 12);
 
     this.dashScreenTexture.needsUpdate = true;
   }
@@ -1276,11 +941,11 @@ export class DrivingSceneRenderer {
     this.qualityPreset = presetName;
     const preset = QUALITY_PRESETS[presetName];
     this.renderer.setPixelRatio(
-      this.isHeadless
+      this.isSoftwareGl
         ? 1
         : Math.min(window.devicePixelRatio || 1, preset.maxPixelRatio),
     );
-    this.renderer.shadowMap.enabled = !this.isHeadless && preset.shadows;
+    this.renderer.shadowMap.enabled = !this.isSoftwareGl && preset.shadows;
   }
 
   public applyLightingPreset(lightingName: LightingPreset): void {
@@ -1294,7 +959,48 @@ export class DrivingSceneRenderer {
     this.hemiLight.intensity = cfg.hemiIntensity;
     this.sunLight.color.setHex(cfg.sunHex);
     this.sunLight.intensity = cfg.sunIntensity;
-    this.headlightsGroup.visible = cfg.headlightsActive;
+    this.headlightSpot.intensity = cfg.headlightsActive ? 4.5 : 0;
+  }
+
+  public applyMapPreset(mapName: MapPreset): void {
+    this.mapPreset = mapName;
+    setActiveRoadMapPreset(mapName);
+    const mapCfg = MAP_PRESETS[mapName];
+
+    this.terrainMaterial.color.setHex(mapCfg.terrainColorHex);
+    this.vistaPeakMat.color.setHex(mapCfg.vistaColorHex);
+    const deepFloor = this.camera.userData.deepFloorMesh as THREE.Mesh;
+    if (deepFloor) {
+      (deepFloor.material as THREE.MeshStandardMaterial).color.setHex(
+        mapCfg.terrainColorHex,
+      );
+    }
+
+    this.waterMesh.visible = mapCfg.waterEnabled;
+    this.urbanTowersInstanced.visible = mapCfg.urbanBuildings;
+    this.desertMesasInstanced.visible = mapCfg.desertMesas;
+
+    const maxAniso = this.renderer.capabilities.getMaxAnisotropy();
+    const newRoadTex = createRoadAsphaltTexture(maxAniso, mapName);
+    this.roadMaterial.map = newRoadTex;
+    this.roadMaterial.needsUpdate = true;
+    this.roadTexture.dispose();
+    this.roadTexture = newRoadTex;
+  }
+
+  public setCameraView(view: CameraViewMode): void {
+    this.cameraView = view;
+  }
+
+  public getCameraView(): CameraViewMode {
+    return this.cameraView;
+  }
+
+  public clearHazardCache(): void {
+    for (const [, node] of this.hazardNodes.entries()) {
+      this.scene.remove(node.group);
+    }
+    this.hazardNodes.clear();
   }
 
   public getDiagnostics(): RendererDiagnostics {
@@ -1303,17 +1009,19 @@ export class DrivingSceneRenderer {
       Math.max(1, Math.round(1000 / Math.max(1, this.smoothedFrameTimeMs))),
     );
     return {
-      activeBackend: this.isHeadless
+      activeBackend: this.isSoftwareGl
         ? 'WebGL 2 (Software Headless Fallback)'
         : 'WebGL 2 (Hardware Accelerated)',
       webgpuSupported: this.webgpuSupported,
       webgpuNote: this.webgpuSupported
-        ? 'WebGPU adapter detected; unified WebGL 2 PBR pipeline active for cross-device shader parity'
-        : 'WebGPU adapter unavailable on this browser/GPU — WebGL 2 fallback active',
+        ? 'WebGPU adapter detected; unified WebGL 2 PBR pipeline active'
+        : 'WebGL 2 PBR pipeline active',
       frameTimeMs: Number(this.smoothedFrameTimeMs.toFixed(1)),
       fps,
       qualityPreset: this.qualityPreset,
       lightingPreset: this.lightingPreset,
+      mapPreset: this.mapPreset,
+      cameraView: this.cameraView,
     };
   }
 
@@ -1361,21 +1069,38 @@ export class DrivingSceneRenderer {
       const worldZ = -h.s + h.lateralOffset * normalZ;
 
       node.group.position.set(worldX, sample.elevationY, worldZ);
-      node.group.rotation.y = -sample.headingRad;
+      // Orient vehicle along road heading AND vertical slope pitchRad so tires sit flush on hills!
+      node.group.rotation.set(sample.pitchRad, -sample.headingRad, 0, 'YXZ');
+
+      // Spin AI traffic wheels based on their longitudinal travel s
+      const wheelRot = -(h.s / 0.34) % (Math.PI * 200);
+      for (const w of node.wheels) {
+        w.rotation.x = wheelRot;
+      }
 
       const flash = Math.sin(timeSec * 18) > 0;
       for (const bMesh of node.brakeLights) {
         const mat = bMesh.material as THREE.MeshStandardMaterial;
         if (h.telegraphActive || h.brakeTriggered) {
-          mat.emissiveIntensity = flash ? 3.2 : 1.4;
+          mat.emissiveIntensity = flash ? 3.5 : 1.6;
         } else {
-          mat.emissiveIntensity = 0.55;
+          mat.emissiveIntensity = 0.75;
         }
       }
 
       if (node.beaconLight) {
         const mat = node.beaconLight.material as THREE.MeshStandardMaterial;
-        mat.emissiveIntensity = flash ? 3.5 : 0.4;
+        mat.emissiveIntensity = flash ? 3.6 : 0.4;
+      }
+
+      if (node.strobeLights && node.strobeLights.length >= 2) {
+        const strobePhase = Math.sin(timeSec * 22) > 0;
+        (
+          node.strobeLights[0].material as THREE.MeshStandardMaterial
+        ).emissiveIntensity = strobePhase ? 3.8 : 0.3;
+        (
+          node.strobeLights[1].material as THREE.MeshStandardMaterial
+        ).emissiveIntensity = strobePhase ? 0.3 : 3.8;
       }
     }
 
@@ -1405,6 +1130,7 @@ export class DrivingSceneRenderer {
     const pose = getInterpolatedVehiclePose(vehicle);
     const baseS = pose.s;
     const presetCfg = QUALITY_PRESETS[this.qualityPreset];
+    const mapCfg = MAP_PRESETS[this.mapPreset];
 
     const segLen = ROAD_CONFIG.segmentLength;
     const segs = ROAD_CONFIG.visibleSegments;
@@ -1415,8 +1141,11 @@ export class DrivingSceneRenderer {
       'position',
     ) as THREE.BufferAttribute;
     const uvAttr = this.roadGeometry.getAttribute('uv') as THREE.BufferAttribute;
+    const tPosAttr = this.terrainGeometry.getAttribute(
+      'position',
+    ) as THREE.BufferAttribute;
 
-    const startSegmentIndex = Math.floor(baseS / segLen) - 4;
+    const startSegmentIndex = Math.floor(baseS / segLen) - 6;
 
     for (let i = 0; i <= segs; i++) {
       const segIdx = startSegmentIndex + i;
@@ -1439,26 +1168,75 @@ export class DrivingSceneRenderer {
 
       uvAttr.setXY(i * 2, 0, vCoord);
       uvAttr.setXY(i * 2 + 1, 1, vCoord);
+
+      // Update Road-Following Terrain Skirt (6 vertices per row)
+      // Strictly anchored below sample.elevationY at road edges so ground NEVER pokes through road!
+      const rowBase = i * 6;
+      const leftVistaDist = 185;
+      const leftBermDist = 14;
+      const rightBermDist = 14;
+      const rightVistaDist = 185;
+
+      const leftSlopeY = mapCfg.waterEnabled
+        ? sample.elevationY - 4.2
+        : sample.elevationY + 2.4 + Math.sin(segIdx * 0.17) * 1.4;
+      const rightSlopeY =
+        sample.elevationY + 3.2 + Math.cos(segIdx * 0.19) * 1.8;
+
+      // Col 0: Outer Left Vista
+      tPosAttr.setXYZ(
+        rowBase + 0,
+        sample.centerX - leftVistaDist * nx,
+        leftSlopeY,
+        -s - leftVistaDist * nz,
+      );
+      // Col 1: Mid Left Embankment Berm
+      tPosAttr.setXYZ(
+        rowBase + 1,
+        sample.centerX - leftBermDist * nx,
+        sample.elevationY - 0.12,
+        -s - leftBermDist * nz,
+      );
+      // Col 2: Inner Left Shoulder Sub-Base (strictly -0.08m below road surface)
+      tPosAttr.setXYZ(rowBase + 2, leftX, sample.elevationY - 0.08, leftZ);
+      // Col 3: Inner Right Shoulder Sub-Base (strictly -0.08m below road surface)
+      tPosAttr.setXYZ(rowBase + 3, rightX, sample.elevationY - 0.08, rightZ);
+      // Col 4: Mid Right Embankment Berm
+      tPosAttr.setXYZ(
+        rowBase + 4,
+        sample.centerX + rightBermDist * nx,
+        sample.elevationY - 0.12,
+        -s + rightBermDist * nz,
+      );
+      // Col 5: Outer Right Vista
+      tPosAttr.setXYZ(
+        rowBase + 5,
+        sample.centerX + rightVistaDist * nx,
+        rightSlopeY,
+        -s + rightVistaDist * nz,
+      );
     }
 
     posAttr.needsUpdate = true;
     uvAttr.needsUpdate = true;
     this.roadGeometry.computeVertexNormals();
 
-    // 1. Update Instanced roadside reflector posts & 3D W-Beam Guardrails
+    tPosAttr.needsUpdate = true;
+    this.terrainGeometry.computeVertexNormals();
+
+    // 1. Update Instanced roadside reflector posts & Continuous 3D W-Beam Guardrails
     const postSpacing = 8.0;
-    const firstPostIdx = Math.floor(baseS / postSpacing) - 2;
-    for (let i = 0; i < 45; i++) {
+    const firstPostIdx = Math.floor(baseS / postSpacing) - 3;
+    for (let i = 0; i < 48; i++) {
       const s = (firstPostIdx + i) * postSpacing;
       const sample = getRoadSample(s);
       const nx = Math.cos(sample.headingRad);
       const nz = Math.sin(sample.headingRad);
 
-      _euler.set(0, -sample.headingRad, 0);
+      _euler.set(sample.pitchRad, -sample.headingRad, 0, 'YXZ');
       _quat.setFromEuler(_euler);
       _scale.set(1, 1, 1);
 
-      // Left post & W-beam rail
       _pos.set(
         sample.centerX - ROAD_CONFIG.guardrailOffset * nx,
         sample.elevationY + 0.42,
@@ -1468,7 +1246,6 @@ export class DrivingSceneRenderer {
       this.leftPostsInstanced.setMatrixAt(i, _mat4);
       this.leftGuardrailsInstanced.setMatrixAt(i, _mat4);
 
-      // Right post & W-beam rail
       _pos.set(
         sample.centerX + ROAD_CONFIG.guardrailOffset * nx,
         sample.elevationY + 0.42,
@@ -1483,30 +1260,46 @@ export class DrivingSceneRenderer {
     this.leftGuardrailsInstanced.instanceMatrix.needsUpdate = true;
     this.rightGuardrailsInstanced.instanceMatrix.needsUpdate = true;
 
-    // 2. Update Highway Street Light Poles along right shoulder (every ~26m)
-    const lampSpacing = 26.0;
+    // 2. Update Highway Street Light Poles & Luminaires along right shoulder
+    const lampSpacing = 24.0;
     const firstLampIdx = Math.floor(baseS / lampSpacing) - 2;
-    for (let i = 0; i < 30; i++) {
+    for (let i = 0; i < 32; i++) {
       const s = (firstLampIdx + i) * lampSpacing;
       const sample = getRoadSample(s);
       const nx = Math.cos(sample.headingRad);
       const nz = Math.sin(sample.headingRad);
+      const side = mapCfg.urbanBuildings && i % 2 === 0 ? -1 : 1;
 
       _euler.set(0, -sample.headingRad, 0);
       _quat.setFromEuler(_euler);
       _scale.set(1, 1, 1);
+
+      const poleDist = ROAD_CONFIG.guardrailOffset + 1.25;
       _pos.set(
-        sample.centerX + (ROAD_CONFIG.guardrailOffset + 1.2) * nx,
-        sample.elevationY + 3.2,
-        -s + (ROAD_CONFIG.guardrailOffset + 1.2) * nz,
+        sample.centerX + side * poleDist * nx,
+        sample.elevationY + 3.3,
+        -s + side * poleDist * nz,
       );
       _mat4.compose(_pos, _quat, _scale);
       this.lamppostsInstanced.setMatrixAt(i, _mat4);
+
+      const headDist = ROAD_CONFIG.guardrailOffset + 0.65;
+      _pos.set(
+        sample.centerX + side * headDist * nx,
+        sample.elevationY + 6.55,
+        -s + side * headDist * nz,
+      );
+      _mat4.compose(_pos, _quat, _scale);
+      this.lampHeadsInstanced.setMatrixAt(i, _mat4);
     }
     this.lamppostsInstanced.instanceMatrix.needsUpdate = true;
+    this.lampHeadsInstanced.instanceMatrix.needsUpdate = true;
 
-    // 3. Update Instanced roadside pine trees
-    const activeTrees = Math.min(80, presetCfg.sceneryCount);
+    // 3. Update Instanced Trees (hidden or sparse in desert/urban, lush in alpine/coastal)
+    const activeTrees =
+      this.mapPreset === 'desert' || this.mapPreset === 'urban'
+        ? 0
+        : Math.min(80, presetCfg.sceneryCount);
     const treeSpacing = 6.5;
     const firstTreeIdx = Math.floor(baseS / treeSpacing) - 3;
     for (let i = 0; i < 80; i++) {
@@ -1522,8 +1315,8 @@ export class DrivingSceneRenderer {
       const sample = getRoadSample(s);
       const nx = Math.cos(sample.headingRad);
       const nz = Math.sin(sample.headingRad);
-      const side = idx % 2 === 0 ? -1 : 1;
-      const distOut = 9.8 + (Math.abs(idx * 17) % 14) * 1.1;
+      const side = this.mapPreset === 'coastal' ? 1 : idx % 2 === 0 ? -1 : 1;
+      const distOut = 10.5 + (Math.abs(idx * 17) % 15) * 1.1;
       const scaleMod = 0.85 + (Math.abs(idx * 31) % 35) / 100;
 
       const x = sample.centerX + side * distOut * nx;
@@ -1533,28 +1326,35 @@ export class DrivingSceneRenderer {
       _quat.setFromEuler(_euler);
       _scale.set(scaleMod, scaleMod, scaleMod);
 
-      _pos.set(x, sample.elevationY + 0.8 * scaleMod, z);
+      _pos.set(x, sample.elevationY + 0.85 * scaleMod, z);
       _mat4.compose(_pos, _quat, _scale);
       this.treesTrunksInstanced.setMatrixAt(i, _mat4);
 
-      _pos.set(x, sample.elevationY + 2.7 * scaleMod, z);
+      _pos.set(x, sample.elevationY + 2.85 * scaleMod, z);
       _mat4.compose(_pos, _quat, _scale);
       this.treesCanopyInstanced.setMatrixAt(i, _mat4);
     }
     this.treesTrunksInstanced.instanceMatrix.needsUpdate = true;
     this.treesCanopyInstanced.instanceMatrix.needsUpdate = true;
 
-    // 4. Update Golden Autumn Birch Trees (staggered alongside pine trees)
+    // 4. Update Autumn Birch Trees
     const autumnSpacing = 14.0;
     const firstAutumnIdx = Math.floor(baseS / autumnSpacing) - 2;
     for (let i = 0; i < 45; i++) {
+      if (this.mapPreset === 'desert' || this.mapPreset === 'urban') {
+        _scale.set(0, 0, 0);
+        _mat4.compose(_pos, _quat, _scale);
+        this.autumnTreesTrunksInstanced.setMatrixAt(i, _mat4);
+        this.autumnTreesCanopyInstanced.setMatrixAt(i, _mat4);
+        continue;
+      }
       const idx = firstAutumnIdx + i;
       const s = idx * autumnSpacing;
       const sample = getRoadSample(s);
       const nx = Math.cos(sample.headingRad);
       const nz = Math.sin(sample.headingRad);
-      const side = idx % 2 === 0 ? 1 : -1;
-      const distOut = 13.8 + (Math.abs(idx * 23) % 12);
+      const side = this.mapPreset === 'coastal' ? 1 : idx % 2 === 0 ? 1 : -1;
+      const distOut = 14.2 + (Math.abs(idx * 23) % 12);
       const scaleMod = 0.9 + (Math.abs(idx * 19) % 30) / 100;
 
       const x = sample.centerX + side * distOut * nx;
@@ -1564,36 +1364,36 @@ export class DrivingSceneRenderer {
       _quat.setFromEuler(_euler);
       _scale.set(scaleMod, scaleMod, scaleMod);
 
-      _pos.set(x, sample.elevationY + 1.1 * scaleMod, z);
+      _pos.set(x, sample.elevationY + 1.05 * scaleMod, z);
       _mat4.compose(_pos, _quat, _scale);
       this.autumnTreesTrunksInstanced.setMatrixAt(i, _mat4);
 
-      _pos.set(x, sample.elevationY + 3.2 * scaleMod, z);
+      _pos.set(x, sample.elevationY + 3.15 * scaleMod, z);
       _mat4.compose(_pos, _quat, _scale);
       this.autumnTreesCanopyInstanced.setMatrixAt(i, _mat4);
     }
     this.autumnTreesTrunksInstanced.instanceMatrix.needsUpdate = true;
     this.autumnTreesCanopyInstanced.instanceMatrix.needsUpdate = true;
 
-    // 5. Update Roadside Granite Boulders
-    const boulderSpacing = 18.0;
+    // 5. Update Roadside Boulders
+    const boulderSpacing = 16.0;
     const firstBoulderIdx = Math.floor(baseS / boulderSpacing) - 2;
-    for (let i = 0; i < 35; i++) {
+    for (let i = 0; i < 36; i++) {
       const idx = firstBoulderIdx + i;
       const s = idx * boulderSpacing;
       const sample = getRoadSample(s);
       const nx = Math.cos(sample.headingRad);
       const nz = Math.sin(sample.headingRad);
       const side = idx % 2 === 0 ? -1 : 1;
-      const distOut = 8.5 + (Math.abs(idx * 29) % 8);
-      const scaleMod = 0.7 + (Math.abs(idx * 13) % 60) / 100;
+      const distOut = 9.2 + (Math.abs(idx * 29) % 9);
+      const scaleMod = 0.75 + (Math.abs(idx * 13) % 65) / 100;
 
       _euler.set(idx * 0.4, -sample.headingRad + idx * 0.7, 0);
       _quat.setFromEuler(_euler);
-      _scale.set(scaleMod * 1.3, scaleMod * 0.85, scaleMod);
+      _scale.set(scaleMod * 1.35, scaleMod * 0.85, scaleMod);
       _pos.set(
         sample.centerX + side * distOut * nx,
-        sample.elevationY + 0.45 * scaleMod,
+        sample.elevationY + 0.42 * scaleMod,
         -s + side * distOut * nz,
       );
       _mat4.compose(_pos, _quat, _scale);
@@ -1601,17 +1401,75 @@ export class DrivingSceneRenderer {
     }
     this.bouldersInstanced.instanceMatrix.needsUpdate = true;
 
-    // 6. Update Overhead Highway Gantries (cycle forward every 480m)
+    // 6. Update Urban Skyscrapers (when urban map is active)
+    if (mapCfg.urbanBuildings) {
+      const towerSpacing = 18.0;
+      const firstTowerIdx = Math.floor(baseS / towerSpacing) - 2;
+      for (let i = 0; i < 36; i++) {
+        const idx = firstTowerIdx + i;
+        const s = idx * towerSpacing;
+        const sample = getRoadSample(s);
+        const nx = Math.cos(sample.headingRad);
+        const nz = Math.sin(sample.headingRad);
+        const side = idx % 2 === 0 ? 1 : -1;
+        const distOut = 20.0 + (Math.abs(idx * 19) % 18);
+        const heightScale = 0.65 + (Math.abs(idx * 37) % 85) / 100;
+
+        _euler.set(0, -sample.headingRad, 0);
+        _quat.setFromEuler(_euler);
+        _scale.set(1.0, heightScale, 1.0);
+        _pos.set(
+          sample.centerX + side * distOut * nx,
+          sample.elevationY + 21 * heightScale - 2,
+          -s + side * distOut * nz,
+        );
+        _mat4.compose(_pos, _quat, _scale);
+        this.urbanTowersInstanced.setMatrixAt(i, _mat4);
+      }
+      this.urbanTowersInstanced.instanceMatrix.needsUpdate = true;
+    }
+
+    // 7. Update Desert Sandstone Mesas (when desert map is active)
+    if (mapCfg.desertMesas) {
+      const mesaSpacing = 24.0;
+      const firstMesaIdx = Math.floor(baseS / mesaSpacing) - 2;
+      for (let i = 0; i < 30; i++) {
+        const idx = firstMesaIdx + i;
+        const s = idx * mesaSpacing;
+        const sample = getRoadSample(s);
+        const nx = Math.cos(sample.headingRad);
+        const nz = Math.sin(sample.headingRad);
+        const side = idx % 2 === 0 ? -1 : 1;
+        const distOut = 24.0 + (Math.abs(idx * 23) % 24);
+        const scaleMod = 0.8 + (Math.abs(idx * 41) % 70) / 100;
+
+        _euler.set(0, idx * 0.5, 0);
+        _quat.setFromEuler(_euler);
+        _scale.set(scaleMod * 1.4, scaleMod, scaleMod * 1.2);
+        _pos.set(
+          sample.centerX + side * distOut * nx,
+          sample.elevationY + 8.5 * scaleMod - 1.5,
+          -s + side * distOut * nz,
+        );
+        _mat4.compose(_pos, _quat, _scale);
+        this.desertMesasInstanced.setMatrixAt(i, _mat4);
+      }
+      this.desertMesasInstanced.instanceMatrix.needsUpdate = true;
+    }
+
+    // 8. Update Overhead Highway Gantries
     for (let i = 0; i < this.highwayGantries.length; i++) {
       const g = this.highwayGantries[i];
       while (g.spacingS < baseS - 40) {
-        g.spacingS += 480;
+        g.spacingS += 495;
+      }
+      while (g.spacingS > baseS + 495) {
+        g.spacingS -= 495;
       }
       const sample = getRoadSample(g.spacingS);
       g.group.position.set(sample.centerX, sample.elevationY, -g.spacingS);
-      g.group.rotation.y = -sample.headingRad;
+      g.group.rotation.set(sample.pitchRad, -sample.headingRad, 0, 'YXZ');
 
-      // Flash beacons if distracted
       const beaconFlash =
         (attentionState === 'DISTRACTED' ||
           attentionState === 'POSSIBLY_DISTRACTED') &&
@@ -1622,11 +1480,14 @@ export class DrivingSceneRenderer {
       }
     }
 
-    // 7. Update Overhead Concrete Overpass Flyover Bridges (cycle forward every 680m)
+    // 9. Update Overhead Concrete Overpass Flyover Bridges
     for (let i = 0; i < this.overpassBridges.length; i++) {
       const bridge = this.overpassBridges[i];
       while (bridge.spacingS < baseS - 60) {
         bridge.spacingS += 680;
+      }
+      while (bridge.spacingS > baseS + 680) {
+        bridge.spacingS -= 680;
       }
       const sample = getRoadSample(bridge.spacingS);
       bridge.group.position.set(
@@ -1634,13 +1495,17 @@ export class DrivingSceneRenderer {
         sample.elevationY,
         -bridge.spacingS,
       );
-      bridge.group.rotation.y = -sample.headingRad; // aligned perpendicular to road
+      bridge.group.rotation.set(sample.pitchRad, -sample.headingRad, 0, 'YXZ');
     }
 
     const vistaGroup = this.camera.userData.vistaGroup as THREE.Group;
-    const groundMesh = this.camera.userData.groundMesh as THREE.Mesh;
-    if (vistaGroup) vistaGroup.position.z = -baseS;
-    if (groundMesh) groundMesh.position.z = -baseS;
+    const deepFloorMesh = this.camera.userData.deepFloorMesh as THREE.Mesh;
+    if (vistaGroup) {
+      vistaGroup.position.z = -baseS;
+      vistaGroup.position.x = getRoadSample(baseS + 180).centerX * 0.5;
+    }
+    if (deepFloorMesh) deepFloorMesh.position.z = -baseS;
+    if (this.waterMesh.visible) this.waterMesh.position.z = -baseS;
 
     this.syncHazards(hazards, baseS, timeSec, presetCfg.drawDistance);
 
@@ -1659,12 +1524,49 @@ export class DrivingSceneRenderer {
     const carWorldZ = -baseS + pose.lateralOffset * nz;
 
     const carYaw = -playerRoad.headingRad - vehicle.headingOffset;
-    const pitchVisual = reducedMotion ? 0 : vehicle.pitchOffset;
+    const pitchVisual =
+      playerRoad.pitchRad + (reducedMotion ? 0 : vehicle.pitchOffset);
     const rollVisual = reducedMotion ? 0 : vehicle.rollOffset;
 
+    // Position & animate Player Hero GT Sports Coupe
+    this.playerHeroCar.group.position.set(carWorldX, carWorldY, carWorldZ);
+    this.playerHeroCar.group.rotation.set(
+      pitchVisual,
+      carYaw,
+      rollVisual,
+      'YXZ',
+    );
+
+    for (const w of this.playerHeroCar.wheels) {
+      w.rotation.x = -vehicle.wheelRotationRad;
+    }
+    if (this.playerHeroCar.frontWheelPivots) {
+      for (const fp of this.playerHeroCar.frontWheelPivots) {
+        fp.rotation.y = -pose.steerAngle * 0.45;
+      }
+    }
+    for (const bLight of this.playerHeroCar.brakeLights) {
+      (bLight.material as THREE.MeshStandardMaterial).emissiveIntensity =
+        vehicle.brakeLightActive ? 3.8 : 1.1;
+    }
+
+    // Position 3D Interior Cockpit Rig
     this.cockpitRig.position.set(carWorldX, carWorldY + 1.18, carWorldZ);
     this.cockpitRig.rotation.set(pitchVisual, carYaw, rollVisual, 'YXZ');
-    this.cockpitRig.visible = !isTitleScreen;
+
+    // Toggle visibility between Cockpit View and Exterior (Chase / Hood / Title) Views
+    const showCockpit = !isTitleScreen && this.cameraView === 'cockpit';
+    this.cockpitRig.visible = showCockpit;
+    this.playerHeroCar.group.visible = !showCockpit;
+
+    // Aim real 3D Headlight SpotLight along the road ahead of the car
+    this.headlightSpot.position.set(carWorldX, carWorldY + 0.68, carWorldZ);
+    const aheadSample = getRoadSample(baseS + 26);
+    this.headlightTarget.position.set(
+      aheadSample.centerX + pose.lateralOffset * Math.cos(aheadSample.headingRad),
+      aheadSample.elevationY,
+      -(baseS + 26) + pose.lateralOffset * Math.sin(aheadSample.headingRad),
+    );
 
     this.steeringWheelGroup.rotation.z = -pose.steerAngle * 1.65;
 
@@ -1672,15 +1574,15 @@ export class DrivingSceneRenderer {
       this.dashWarningStripMat.color.setHex(0xef4444);
       this.dashWarningStripMat.emissive.setHex(0xef4444);
       this.dashWarningStripMat.emissiveIntensity =
-        1.5 + Math.sin(timeSec * 20) * 1.0;
+        1.6 + Math.sin(timeSec * 20) * 1.0;
     } else if (attentionState === 'POSSIBLY_DISTRACTED') {
       this.dashWarningStripMat.color.setHex(0xf59e0b);
       this.dashWarningStripMat.emissive.setHex(0xf59e0b);
-      this.dashWarningStripMat.emissiveIntensity = 1.2;
+      this.dashWarningStripMat.emissiveIntensity = 1.25;
     } else {
       this.dashWarningStripMat.color.setHex(0x10b981);
       this.dashWarningStripMat.emissive.setHex(0x10b981);
-      this.dashWarningStripMat.emissiveIntensity = 0.5;
+      this.dashWarningStripMat.emissiveIntensity = 0.55;
     }
 
     const laneShiftClamped = THREE.MathUtils.clamp(
@@ -1690,49 +1592,104 @@ export class DrivingSceneRenderer {
     );
     this.dashLaneBarMesh.position.x = laneShiftClamped;
 
-    if (isTitleScreen) {
-      const orbitOffset = Math.sin(timeSec * 0.45) * 2.8;
-      this.camera.position.set(
-        carWorldX + orbitOffset,
-        carWorldY + 3.4,
-        carWorldZ + 5.5,
+    // Dynamic FOV Speed Sense (63° base -> up to 71° at high speed)
+    const speedRatio = Math.min(1, vehicle.speed / 34);
+    const targetFov = isTitleScreen
+      ? 56
+      : reducedMotion
+      ? 64
+      : 63 + speedRatio * 8.5;
+    if (Math.abs(this.camera.fov - targetFov) > 0.05) {
+      this.camera.fov = THREE.MathUtils.damp(
+        this.camera.fov,
+        targetFov,
+        6,
+        Math.max(0.001, dt),
       );
-      const lookAheadSample = getRoadSample(baseS + 28);
+      this.camera.updateProjectionMatrix();
+    }
+
+    const forwardX = -Math.sin(carYaw);
+    const forwardZ = -Math.cos(carYaw);
+    const rightX = Math.cos(carYaw);
+    const rightZ = -Math.sin(carYaw);
+
+    if (isTitleScreen) {
+      // Smooth showcase camera framing the GT Sports Coupe in the right two-thirds of the viewport
+      const sway = Math.sin(timeSec * 0.5) * 0.65;
+      _targetCamPos.set(
+        carWorldX - forwardX * 5.2 + rightX * (1.55 + sway),
+        carWorldY + 1.85,
+        carWorldZ - forwardZ * 5.2 + rightZ * (1.55 + sway),
+      );
+      this.camera.position.copy(_targetCamPos);
       _lookTarget.set(
-        lookAheadSample.centerX,
-        lookAheadSample.elevationY + 1.0,
-        -(baseS + 28),
+        carWorldX + forwardX * 8.0 - rightX * 1.1,
+        carWorldY + 0.95,
+        carWorldZ + forwardZ * 8.0 - rightZ * 1.1,
       );
       this.camera.lookAt(_lookTarget);
+      this.cameraInitialized = false;
     } else {
-      // Restrained camera motion: subtle impact bump without disorienting shake
       const shakeAmt = reducedMotion
         ? 0
         : vehicle.trauma * vehicle.trauma * 0.025;
       const shakeX = Math.sin(timeSec * 42) * shakeAmt;
       const shakeY = Math.cos(timeSec * 48) * shakeAmt;
 
-      this.camera.position.set(
-        carWorldX + shakeX,
-        carWorldY + 1.22 + shakeY,
-        carWorldZ,
-      );
-
       const targetHeadYawRad = THREE.MathUtils.degToRad(-headYawDeg * 0.72);
       const targetHeadPitchRad = THREE.MathUtils.degToRad(
         -headPitchDeg * 0.55,
       );
 
-      const dampFactor = 1 - Math.exp(-8.5 * Math.max(0.001, dt));
+      const dampFactor = 1 - Math.exp(-9.5 * Math.max(0.001, dt));
       this.smoothedHeadYawRad +=
         (targetHeadYawRad - this.smoothedHeadYawRad) * dampFactor;
       this.smoothedHeadPitchRad +=
         (targetHeadPitchRad - this.smoothedHeadPitchRad) * dampFactor;
 
+      let desiredLocalOffset: THREE.Vector3;
+      if (this.cameraView === 'chase') {
+        desiredLocalOffset = _targetCamPos.set(0, 1.92, 5.15);
+      } else if (this.cameraView === 'hood') {
+        desiredLocalOffset = _targetCamPos.set(0, 1.06, -0.85);
+      } else {
+        desiredLocalOffset = _targetCamPos.set(0, 1.22, 0);
+      }
+
+      if (!this.cameraInitialized) {
+        this.smoothedCamOffset.copy(desiredLocalOffset);
+        this.cameraInitialized = true;
+      } else {
+        this.smoothedCamOffset.lerp(
+          desiredLocalOffset,
+          1 - Math.exp(-10 * Math.max(0.001, dt)),
+        );
+      }
+
+      // Transform local camera offset by car heading
+      const worldCamX =
+        carWorldX +
+        rightX * this.smoothedCamOffset.x -
+        forwardX * this.smoothedCamOffset.z +
+        shakeX;
+      const worldCamY =
+        carWorldY +
+        this.smoothedCamOffset.y -
+        this.smoothedCamOffset.z * Math.sin(pitchVisual) +
+        shakeY;
+      const worldCamZ =
+        carWorldZ +
+        rightZ * this.smoothedCamOffset.x -
+        forwardZ * this.smoothedCamOffset.z;
+
+      this.camera.position.set(worldCamX, worldCamY, worldCamZ);
+
+      const basePitchBias = this.cameraView === 'chase' ? -0.11 : -0.028;
       this.camera.rotation.set(
-        pitchVisual + this.smoothedHeadPitchRad - 0.03,
+        pitchVisual + this.smoothedHeadPitchRad + basePitchBias,
         carYaw + this.smoothedHeadYawRad,
-        rollVisual,
+        rollVisual * (this.cameraView === 'chase' ? 0.55 : 1.0),
         'YXZ',
       );
     }
@@ -1743,8 +1700,8 @@ export class DrivingSceneRenderer {
         if (ev.type === 'hazard' || ev.type === 'guardrail') {
           this.particleEngine.emitImpactSparks(
             carWorldX,
-            carWorldY + 0.38,
-            carWorldZ - 0.8,
+            carWorldY + 0.45,
+            carWorldZ - 1.2,
             34,
             ev.type === 'guardrail',
           );
@@ -1756,10 +1713,19 @@ export class DrivingSceneRenderer {
     this.renderer.render(this.scene, this.camera);
   }
 
+  public isUsingSoftwareGl(): boolean {
+    return this.isSoftwareGl;
+  }
+
+  public getWebGLContext(): WebGL2RenderingContext | null {
+    return this.renderer.getContext() as WebGL2RenderingContext | null;
+  }
+
   public dispose(): void {
     this.resizeObserver.disconnect();
     this.particleEngine.dispose();
     this.roadGeometry.dispose();
+    this.terrainGeometry.dispose();
     this.roadTexture.dispose();
     this.dashScreenTexture.dispose();
     this.renderer.dispose();

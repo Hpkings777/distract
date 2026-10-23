@@ -1,20 +1,28 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import {
+  CAMERA_VIEW_MODES,
   DEFAULT_ACCESSIBILITY_SETTINGS,
   DEFAULT_AUDIO_SETTINGS,
   DEFAULT_SIDE_DISPLAY_CONFIG,
+  DEFAULT_TRAFFIC_CONFIG,
   EXPERIMENT_CONFIG,
+  MAP_PRESETS,
   ROAD_CONFIG,
+  TRAFFIC_DENSITY_COUNTS,
 } from './config.ts';
 import type {
   AccessibilitySettings,
   AppMode,
   AttentionState,
   AudioSettings,
+  CameraViewMode,
   GameState,
   LightingPreset,
+  MapPreset,
   QualityPreset,
   SideDisplayConfig,
+  TrafficConfig,
+  TrafficDensityPreset,
 } from './config.ts';
 import { generateInitialHazards } from './road.ts';
 import type { RoadHazard } from './road.ts';
@@ -48,7 +56,7 @@ import { SidePatternVisual } from './components/SidePatternCanvas.tsx';
 import { TouchControlsOverlay } from './components/TouchControlsOverlay.tsx';
 import { SettingsModal } from './components/SettingsModal.tsx';
 import type { SettingsTabId } from './components/SettingsModal.tsx';
-import { DriverGazeIcon, ForwardRadarScope } from './components/CustomIcons.tsx';
+import { AutomotiveHud } from './components/AutomotiveHud.tsx';
 
 const REFERENCE_BASELINE_SUMMARY: TrialSummary = {
   trialType: 'baseline',
@@ -72,6 +80,8 @@ interface InterfaceHudSnapshot {
   speedKmh: number;
   gear: number;
   rpmNormalized: number;
+  lateralAccelG: number;
+  longitudinalAccelG: number;
   distanceMeters: number;
   laneDeviationMeters: number;
   lateralOffset: number;
@@ -94,11 +104,6 @@ interface InterfaceHudSnapshot {
   }>;
 }
 
-/**
- * Dedicated companion window view when opened with ?side=left or ?side=right.
- * Does NOT load the 3D driving scene — uses lightweight SVG/Canvas stimulus rendering
- * and synchronizes over WebRTC DataChannels + WebSocket relay + BroadcastChannel.
- */
 function SideDisplayCompanionView({
   side,
   roomId,
@@ -149,21 +154,21 @@ function SideDisplayCompanionView({
   const colorHex = side === 'left' ? payload.leftColor : payload.rightColor;
 
   return (
-    <main className="w-screen h-screen bg-[#070b14] text-slate-100 flex flex-col items-center justify-between p-5 sm:p-8 select-none overflow-hidden">
+    <main className="w-screen h-screen bg-[#060911] text-slate-100 flex flex-col items-center justify-between p-5 sm:p-8 select-none overflow-hidden">
       <div className="w-full flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/90 pb-3.5">
         <div>
           <div className="text-[11px] font-mono-tabular uppercase tracking-widest text-amber-400">
             DISTRACT · PERIPHERAL STIMULUS DISPLAY ({side.toUpperCase()}) · ROOM:{' '}
             {roomId}
           </div>
-          <h1 className="text-lg sm:text-xl font-display font-bold text-white mt-0.5">
+          <h1 className="text-lg sm:text-xl font-display font-bold text-white mt-0.5 uppercase">
             Synchronized Visual Attractor
           </h1>
         </div>
 
         <div className="flex items-center gap-2">
           <span
-            className={`px-2.5 py-1 rounded text-xs font-mono-tabular border ${
+            className={`px-2.5 py-1 rounded-sm text-xs font-mono-tabular border ${
               netTelemetry.relayConnected
                 ? 'bg-emerald-950/90 border-emerald-500/60 text-emerald-300'
                 : 'bg-amber-950/90 border-amber-500/60 text-amber-300'
@@ -175,7 +180,7 @@ function SideDisplayCompanionView({
           <button
             type="button"
             onClick={() => netRef.current?.reconnect()}
-            className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 cursor-pointer"
+            className="px-3 py-1.5 rounded-sm bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 cursor-pointer"
           >
             Reconnect
           </button>
@@ -191,7 +196,7 @@ function SideDisplayCompanionView({
                 symbolLabel: isActive ? 'STANDBY' : 'MANUAL TEST PULSE',
               }))
             }
-            className="px-3.5 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-display font-bold cursor-pointer"
+            className="px-3.5 py-1.5 rounded-sm bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-display font-bold cursor-pointer"
           >
             {isActive ? 'Stop Test Stimulus' : 'Trigger Test Stimulus'}
           </button>
@@ -263,13 +268,18 @@ function MainSimulatorApp({
   const [trialType, setTrialType] = useState<'baseline' | 'distracted'>(
     'distracted',
   );
+  const [mapPreset, setMapPreset] = useState<MapPreset>('alpine');
+  const [cameraView, setCameraView] = useState<CameraViewMode>('cockpit');
+  const [trafficConfig, setTrafficConfig] = useState<TrafficConfig>(
+    DEFAULT_TRAFFIC_CONFIG,
+  );
   const [qualityPreset, setQualityPreset] =
     useState<QualityPreset>('balanced');
   const [lightingPreset, setLightingPreset] =
     useState<LightingPreset>('dusk');
 
   const [showSettingsModal, setShowSettingsModal] = useState<boolean>(false);
-  const [settingsTab, setSettingsTab] = useState<SettingsTabId>('display');
+  const [settingsTab, setSettingsTab] = useState<SettingsTabId>('world');
   const [leftPreviewCollapsed, setLeftPreviewCollapsed] =
     useState<boolean>(false);
   const [rightPreviewCollapsed, setRightPreviewCollapsed] =
@@ -303,11 +313,14 @@ function MainSimulatorApp({
     baseline: TrialSummary | null;
     distracted: TrialSummary | null;
   }>({ baseline: null, distracted: null });
+  const [isSimulatedClosed, setIsSimulatedClosed] = useState(false);
 
   const [hud, setHud] = useState<InterfaceHudSnapshot>(() => ({
-    speedKmh: 60,
+    speedKmh: 76,
     gear: 3,
     rpmNormalized: 0.42,
+    lateralAccelG: 0,
+    longitudinalAccelG: 0,
     distanceMeters: 0,
     laneDeviationMeters: 0,
     lateralOffset: ROAD_CONFIG.playerDefaultLaneOffset,
@@ -316,6 +329,12 @@ function MainSimulatorApp({
     attention: {
       state: 'ATTENTIVE',
       mode: 'simulated',
+      eyesClosed: false,
+      eyeOpenness: 1.0,
+      closureDurationMs: 0,
+      closureDurationSec: 0,
+      thresholdSec: 5.0,
+      emergencySlowdownActive: false,
       yawDeg: 0,
       pitchDeg: 0,
       calibratedYawOffset: 0,
@@ -323,7 +342,7 @@ function MainSimulatorApp({
       confidence: 1,
       sustainedDeviationMs: 0,
       calibrationProgress: 1,
-      statusMessage: 'Simulated monitoring active',
+      statusMessage: 'Simulated DMS active',
     },
     trialElapsedSec: 0,
     trialType: 'distracted',
@@ -369,6 +388,8 @@ function MainSimulatorApp({
       fps: 60,
       qualityPreset: 'balanced',
       lightingPreset: 'dusk',
+      mapPreset: 'alpine',
+      cameraView: 'cockpit',
     },
     upcomingHazards: [],
   }));
@@ -377,11 +398,16 @@ function MainSimulatorApp({
   const gameStateRef = useRef<GameState>(autostart ? 'playing' : 'title');
   const appModeRef = useRef<AppMode>('experiment');
   const trialTypeRef = useRef<'baseline' | 'distracted'>('distracted');
+  const mapPresetRef = useRef<MapPreset>('alpine');
+  const cameraViewRef = useRef<CameraViewMode>('cockpit');
+  const trafficConfigRef = useRef<TrafficConfig>(DEFAULT_TRAFFIC_CONFIG);
   const accessibilityRef = useRef<AccessibilitySettings>(
     DEFAULT_ACCESSIBILITY_SETTINGS,
   );
   const vehicleRef = useRef<VehicleState>(createInitialVehicleState());
-  const hazardsRef = useRef<RoadHazard[]>(generateInitialHazards(1042, 24));
+  const hazardsRef = useRef<RoadHazard[]>(
+    generateInitialHazards(1042, undefined, DEFAULT_TRAFFIC_CONFIG),
+  );
   const inputAdapterRef = useRef<InputAdapter | null>(null);
   const attentionMonitorRef = useRef<AttentionMonitor>(
     new AttentionMonitor('simulated'),
@@ -417,6 +443,49 @@ function MainSimulatorApp({
     setShowSettingsModal(true);
   }, []);
 
+  const handleCycleCameraView = useCallback(() => {
+    const order: CameraViewMode[] = ['cockpit', 'chase', 'hood'];
+    const nextIdx = (order.indexOf(cameraViewRef.current) + 1) % order.length;
+    const nextView = order[nextIdx];
+    cameraViewRef.current = nextView;
+    setCameraView(nextView);
+    sceneRendererRef.current?.setCameraView(nextView);
+  }, []);
+
+  const handleChangeCameraView = useCallback((view: CameraViewMode) => {
+    cameraViewRef.current = view;
+    setCameraView(view);
+    sceneRendererRef.current?.setCameraView(view);
+  }, []);
+
+  const handleMapChange = useCallback((preset: MapPreset) => {
+    mapPresetRef.current = preset;
+    setMapPreset(preset);
+    const recommendedLighting = MAP_PRESETS[preset].defaultLighting;
+    setLightingPreset(recommendedLighting);
+    sceneRendererRef.current?.applyMapPreset(preset);
+  }, []);
+
+  const handleUpdateTrafficConfig = useCallback(
+    (partial: Partial<TrafficConfig>) => {
+      const updated: TrafficConfig = {
+        ...trafficConfigRef.current,
+        ...partial,
+      };
+      trafficConfigRef.current = updated;
+      setTrafficConfig(updated);
+      // Regenerate active hazards positioned ahead of current vehicle s
+      const baseSeed = trialTypeRef.current === 'baseline' ? 1042 : 2084;
+      const freshHazards = generateInitialHazards(baseSeed, undefined, updated);
+      const currentS = vehicleRef.current.s;
+      for (const h of freshHazards) {
+        h.s += currentS;
+      }
+      hazardsRef.current = freshHazards;
+    },
+    [],
+  );
+
   const startDrivingSession = useCallback(
     (selectedMode: AppMode, selectedTrialType: 'baseline' | 'distracted') => {
       if (document.activeElement instanceof HTMLElement) {
@@ -430,7 +499,8 @@ function MainSimulatorApp({
       vehicleRef.current = createInitialVehicleState();
       hazardsRef.current = generateInitialHazards(
         selectedTrialType === 'baseline' ? 1042 : 2084,
-        24,
+        undefined,
+        trafficConfigRef.current,
       );
       inputAdapterRef.current?.clearHeldKeys();
       experimentRef.current.startRun(selectedTrialType);
@@ -464,6 +534,11 @@ function MainSimulatorApp({
     startDrivingSession(appModeRef.current, trialTypeRef.current);
   }, [startDrivingSession]);
 
+  const handleToggleSimulatedEyes = useCallback(() => {
+    const next = webcamTrackerRef.current.toggleSimulatedEyesClosed();
+    setIsSimulatedClosed(next);
+  }, []);
+
   useEffect(() => {
     const mountEl = canvasMountRef.current;
     if (!mountEl) return;
@@ -471,7 +546,13 @@ function MainSimulatorApp({
     const inputAdapter = new InputAdapter();
     inputAdapterRef.current = inputAdapter;
 
-    const renderer = new DrivingSceneRenderer(mountEl, 'balanced', 'dusk');
+    const renderer = new DrivingSceneRenderer(
+      mountEl,
+      'balanced',
+      'dusk',
+      mapPresetRef.current,
+    );
+    renderer.setCameraView(cameraViewRef.current);
     sceneRendererRef.current = renderer;
 
     const netMgr = new SideDisplayNetworkManager(
@@ -506,8 +587,10 @@ function MainSimulatorApp({
         ) {
           startDrivingSession(appModeRef.current, trialTypeRef.current);
         } else if (inputAdapter.consumeJustPressed('KeyS')) {
-          setSettingsTab('display');
+          setSettingsTab('world');
           setShowSettingsModal((v) => !v);
+        } else if (inputAdapter.consumeJustPressed('KeyC')) {
+          handleCycleCameraView();
         }
       } else if (gameStateRef.current === 'playing') {
         if (
@@ -523,19 +606,19 @@ function MainSimulatorApp({
         } else if (inputAdapter.consumeJustPressed('KeyR')) {
           startDrivingSession(appModeRef.current, trialTypeRef.current);
         } else if (inputAdapter.consumeJustPressed('KeyM')) {
-          const isMutedNow = soundRef.current.toggleMute();
+          soundRef.current.toggleMute();
           setAudioSettings(soundRef.current.getSettings());
-          void isMutedNow;
+        } else if (inputAdapter.consumeJustPressed('KeyE')) {
+          handleToggleSimulatedEyes();
         } else if (inputAdapter.consumeJustPressed('KeyV')) {
           const curSide = experimentRef.current.getStimulus().activeSide;
           experimentRef.current.triggerManualStimulus(
             curSide === 'left' ? 'right' : 'left',
             Math.floor(timeSec),
           );
-        } else if (
-          inputAdapter.consumeJustPressed('KeyC') ||
-          inputAdapter.consumeJustPressed('KeyS')
-        ) {
+        } else if (inputAdapter.consumeJustPressed('KeyC')) {
+          handleCycleCameraView();
+        } else if (inputAdapter.consumeJustPressed('KeyS')) {
           setShowSettingsModal((v) => !v);
         } else if (inputAdapter.consumeJustPressed('KeyF')) {
           const finalSummary = experimentRef.current.finalizeCurrentRun(
@@ -563,28 +646,8 @@ function MainSimulatorApp({
       const { vehicleInput, telemetry } = inputAdapter.sampleInput();
 
       const monitor = attentionMonitorRef.current;
-      let attentionSnap: AttentionSnapshot;
-
-      if (monitor.getState().mode === 'webcam') {
-        const obs = webcamTrackerRef.current.sampleObservation();
-        if (telemetry.simulatingLookAwayLeft) obs.yawDeg = -28;
-        if (telemetry.simulatingLookAwayRight) obs.yawDeg = 28;
-        attentionSnap = monitor.update(obs, nowMs);
-      } else {
-        let simYaw = 0;
-        if (telemetry.simulatingLookAwayLeft) simYaw = -28;
-        else if (telemetry.simulatingLookAwayRight) simYaw = 28;
-
-        attentionSnap = monitor.update(
-          {
-            yawDeg: simYaw,
-            pitchDeg: 0,
-            confidence: 0.99,
-            source: 'simulated',
-          },
-          nowMs,
-        );
-      }
+      const obs = webcamTrackerRef.current.sampleObservation();
+      const attentionSnap = monitor.update(obs, nowMs);
 
       if (gameStateRef.current === 'title') {
         soundRef.current.updateEngineHum(0, false);
@@ -594,21 +657,21 @@ function MainSimulatorApp({
           hazardsRef.current,
           dt,
           true,
+          false,
         );
+        // Keep demo car cleanly centered in right lane during title screen showcase
+        vehicleRef.current.lateralOffset = ROAD_CONFIG.playerDefaultLaneOffset;
+        vehicleRef.current.lateralVelocity = 0;
+        vehicleRef.current.headingOffsetRad = 0;
       } else if (gameStateRef.current === 'playing') {
-        const distractionDrift =
-          attentionSnap.state === 'DISTRACTED' ||
-          attentionSnap.state === 'POSSIBLY_DISTRACTED'
-            ? (attentionSnap.yawDeg / 28) * 0.25
-            : 0;
+        const emergencySlowdown = attentionSnap.emergencySlowdownActive;
 
         const effectiveInput = {
-          steer: Math.max(
-            -1,
-            Math.min(1, vehicleInput.steer + distractionDrift),
-          ),
-          throttle: vehicleInput.throttle,
-          brake: vehicleInput.brake,
+          steer: vehicleInput.steer,
+          throttle: emergencySlowdown ? 0 : vehicleInput.throttle,
+          brake: emergencySlowdown
+            ? Math.max(0.9, vehicleInput.brake)
+            : vehicleInput.brake,
         };
 
         const collisionEvents = stepVehicleSimulation(
@@ -617,6 +680,7 @@ function MainSimulatorApp({
           hazardsRef.current,
           dt,
           true,
+          emergencySlowdown,
         );
 
         soundRef.current.updateEngineHum(
@@ -632,9 +696,9 @@ function MainSimulatorApp({
         if (vehicleRef.current.isOnShoulder) {
           soundRef.current.playRumbleTick();
         }
-        if (attentionSnap.state === 'DISTRACTED') {
-          soundRef.current.playDistractionBeep(true);
-        } else if (attentionSnap.state === 'POSSIBLY_DISTRACTED') {
+        if (attentionSnap.emergencySlowdownActive) {
+          soundRef.current.playDrowsinessCriticalAlarm();
+        } else if (attentionSnap.eyesClosed) {
           soundRef.current.playDistractionBeep(false);
         }
 
@@ -681,6 +745,18 @@ function MainSimulatorApp({
         accessibilityRef.current.reducedMotion,
       );
 
+      // Expose deterministic inspection hook for testing
+      if (typeof window !== 'undefined') {
+        (window as unknown as Record<string, unknown>).__SIM_DEBUG__ = {
+          gameState: gameStateRef.current,
+          mapPreset: mapPresetRef.current,
+          cameraView: cameraViewRef.current,
+          trafficConfig: trafficConfigRef.current,
+          vehicle: vehicleRef.current,
+          hazardsCount: hazardsRef.current.length,
+        };
+      }
+
       // Sync React HUD state at ~10Hz
       if (nowMs - lastHudSyncMs >= 95) {
         lastHudSyncMs = nowMs;
@@ -691,6 +767,8 @@ function MainSimulatorApp({
           speedKmh: Math.round(vehicleRef.current.speed * 3.6),
           gear: vehicleRef.current.gear,
           rpmNormalized: vehicleRef.current.rpmNormalized,
+          lateralAccelG: vehicleRef.current.lateralAccelG,
+          longitudinalAccelG: vehicleRef.current.longitudinalAccelG,
           distanceMeters: Math.round(vehicleRef.current.s),
           laneDeviationMeters: Number(
             vehicleRef.current.laneDeviationMeters.toFixed(2),
@@ -712,7 +790,7 @@ function MainSimulatorApp({
             .filter(
               (h) =>
                 h.s >= vehicleRef.current.s &&
-                h.s <= vehicleRef.current.s + 85,
+                h.s <= vehicleRef.current.s + 95,
             )
             .map((h) => ({
               s: Math.round(h.s),
@@ -733,7 +811,7 @@ function MainSimulatorApp({
       netMgr.dispose();
       renderer.dispose();
     };
-  }, [initialRoom, startDrivingSession]);
+  }, [initialRoom, startDrivingSession, handleCycleCameraView]);
 
   const handleQualityChange = (preset: QualityPreset) => {
     setQualityPreset(preset);
@@ -795,22 +873,6 @@ function MainSimulatorApp({
     }
   };
 
-  const attentionBadgeStyle = (state: AttentionState) => {
-    switch (state) {
-      case 'ATTENTIVE':
-        return 'bg-emerald-950/90 border-emerald-500/60 text-emerald-300';
-      case 'POSSIBLY_DISTRACTED':
-        return 'bg-amber-950/90 border-amber-500/70 text-amber-300';
-      case 'DISTRACTED':
-        return 'bg-rose-950/95 border-rose-500 text-rose-200';
-      case 'CALIBRATING':
-      case 'INITIALIZING':
-        return 'bg-sky-950/90 border-sky-500/60 text-sky-300';
-      case 'CAMERA_UNAVAILABLE':
-        return 'bg-slate-900/95 border-amber-500/60 text-amber-300';
-    }
-  };
-
   const showTouchControls =
     gameState === 'playing' &&
     !showSettingsModal &&
@@ -827,14 +889,10 @@ function MainSimulatorApp({
   const distractedData =
     savedComparison.distracted || completedSummary || null;
 
-  const highContrastBorder = accessibilitySettings.highContrastHud
-    ? 'border-slate-300'
-    : 'border-slate-700/80';
-
   return (
     <div
       onContextMenu={(e) => e.preventDefault()}
-      className="relative w-screen h-screen overflow-hidden bg-[#090d16] select-none touch-none"
+      className="relative w-screen h-screen overflow-hidden bg-[#060911] select-none touch-none"
     >
       {/* Isolated WebGL Mount Container */}
       <div
@@ -843,323 +901,21 @@ function MainSimulatorApp({
       />
 
       {/* =====================================================================
-          STATE 1: TITLE SCREEN (Live 3D Highway Flyover + Bespoke SVG Lockup)
+          STATE 1: NATIVE MOTORSPORT TITLE LAUNCHER (Live 3D GT Car Showcase)
           ===================================================================== */}
       {gameState === 'title' && (
-        <div className="fixed inset-0 z-20 pointer-events-none flex flex-col justify-between p-4 sm:p-6 md:p-12 bg-gradient-to-r from-[#090d16]/90 via-[#090d16]/60 to-transparent overflow-y-auto">
-          {/* Top Minimal Exhibition Identity */}
+        <div className="fixed inset-0 z-20 pointer-events-none flex flex-col justify-between p-4 sm:p-6 md:p-10 bg-gradient-to-r from-[#060911]/95 via-[#060911]/65 to-transparent overflow-y-auto">
+          {/* Top Minimal Telemetry Bar */}
           <div className="flex items-center justify-between gap-2 pointer-events-auto">
-            <div className="text-[11px] sm:text-xs font-mono-tabular tracking-widest uppercase text-slate-300">
-              SCIENCE EXHIBITION SIMULATOR · HUMAN FACTORS &amp; ROAD SAFETY
+            <div className="flex items-center gap-2 text-[11px] sm:text-xs font-mono-tabular tracking-widest uppercase text-slate-300">
+              <span className="inline-block w-2 h-2 bg-amber-400" />
+              <span>HUMAN FACTORS &amp; HIGHWAY SAFETY SIMULATOR</span>
             </div>
-            <button
-              type="button"
-              onClick={() => openSettingsOnTab('display')}
-              className="px-3.5 py-1.5 rounded-lg bg-slate-900/90 hover:bg-slate-800 text-slate-200 border border-slate-700 text-xs font-semibold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
-            >
-              <svg
-                viewBox="0 0 24 24"
-                className="w-4 h-4 text-amber-400"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-              >
-                <circle cx="12" cy="12" r="3" />
-                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-              </svg>
-              <span>Settings &amp; Side Displays [S]</span>
-            </button>
-          </div>
-
-          {/* Left-Third Asymmetric Title Lockup & Mode Selector */}
-          <div className="max-w-xl pointer-events-auto my-auto py-4">
-            <svg
-              viewBox="0 0 520 118"
-              className="w-full max-w-[460px] h-auto mb-3 sm:mb-4"
-              role="img"
-              aria-label="DISTRACT — Driver Attention & Road Safety Simulator"
-            >
-              <polygon points="28,14 66,14 48,96 10,96" fill="#f59e0b" />
-              <polygon points="76,14 102,14 84,96 58,96" fill="#38bdf8" />
-              <path d="M18 55 L98 55" stroke="#090d16" strokeWidth="5" />
-              <text
-                x="118"
-                y="68"
-                fill="#f8fafc"
-                fontFamily="Chakra Petch, sans-serif"
-                fontWeight="700"
-                fontSize="64"
-                letterSpacing="4"
-              >
-                DISTRACT
-              </text>
-              <text
-                x="120"
-                y="96"
-                fill="#94a3b8"
-                fontFamily="IBM Plex Mono, monospace"
-                fontWeight="600"
-                fontSize="13.5"
-                letterSpacing="2.2"
-              >
-                DRIVER ATTENTION &amp; ROAD SAFETY LAB
-              </text>
-            </svg>
-
-            <p className="text-slate-200 text-sm sm:text-base leading-relaxed mb-4 sm:mb-6 max-w-lg">
-              Experience how taking your eyes off the road for just two seconds
-              degrades lane keeping, delays hazard braking reaction, and
-              increases collision risk.
-            </p>
-
-            {/* Three Exhibition Modes Selector */}
-            <div
-              className="grid grid-cols-1 sm:grid-cols-3 gap-2 sm:gap-2.5 mb-4"
-              role="group"
-              aria-label="Select Exhibition Mode"
-            >
+            <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={() => {
-                  setAppMode('experiment');
-                  setTrialType('distracted');
-                }}
-                className={`p-2.5 sm:p-3 rounded-lg border text-left transition-colors cursor-pointer ${
-                  appMode === 'experiment'
-                    ? 'bg-slate-900/95 border-amber-400 text-white'
-                    : 'bg-slate-950/85 border-slate-800 text-slate-300 hover:border-slate-600'
-                }`}
-              >
-                <div className="text-xs font-mono-tabular uppercase text-amber-400 font-semibold">
-                  01 · EXPERIMENT
-                </div>
-                <div className="text-sm font-bold mt-0.5">
-                  Timed Safety Trial
-                </div>
-                <div className="text-xs text-slate-400 mt-0.5">
-                  Compare Baseline vs. Distracted driving
-                </div>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setAppMode('demo')}
-                className={`p-2.5 sm:p-3 rounded-lg border text-left transition-colors cursor-pointer ${
-                  appMode === 'demo'
-                    ? 'bg-slate-900/95 border-sky-400 text-white'
-                    : 'bg-slate-950/85 border-slate-800 text-slate-300 hover:border-slate-600'
-                }`}
-              >
-                <div className="text-xs font-mono-tabular uppercase text-sky-400 font-semibold">
-                  02 · DEMO
-                </div>
-                <div className="text-sm font-bold mt-0.5">Free Drive Demo</div>
-                <div className="text-xs text-slate-400 mt-0.5">
-                  Continuous highway &amp; simulated alerts
-                </div>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setAppMode('calibration')}
-                className={`p-2.5 sm:p-3 rounded-lg border text-left transition-colors cursor-pointer ${
-                  appMode === 'calibration'
-                    ? 'bg-slate-900/95 border-emerald-400 text-white'
-                    : 'bg-slate-950/85 border-slate-800 text-slate-300 hover:border-slate-600'
-                }`}
-              >
-                <div className="text-xs font-mono-tabular uppercase text-emerald-400 font-semibold">
-                  03 · CALIBRATION
-                </div>
-                <div className="text-sm font-bold mt-0.5">
-                  Wheel &amp; Camera
-                </div>
-                <div className="text-xs text-slate-400 mt-0.5">
-                  USB steering axes, touch &amp; QR setup
-                </div>
-              </button>
-            </div>
-
-            {appMode === 'experiment' && (
-              <div className="flex flex-col sm:flex-row sm:items-center gap-2 mb-4 sm:mb-5 bg-slate-950/90 border border-slate-800 p-2 rounded-lg">
-                <span className="text-xs text-slate-400 px-1 sm:px-2 shrink-0">
-                  Trial Condition:
-                </span>
-                <div className="flex flex-col sm:flex-row gap-1.5 flex-1">
-                  <button
-                    type="button"
-                    onClick={() => setTrialType('baseline')}
-                    className={`flex-1 py-1.5 px-3 rounded text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
-                      trialType === 'baseline'
-                        ? 'bg-emerald-500 text-slate-950'
-                        : 'text-slate-300 hover:bg-slate-800'
-                    }`}
-                  >
-                    Run A: Attentive Baseline (45s)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setTrialType('distracted')}
-                    className={`flex-1 py-1.5 px-3 rounded text-xs font-semibold transition-colors cursor-pointer whitespace-nowrap ${
-                      trialType === 'distracted'
-                        ? 'bg-amber-500 text-slate-950'
-                        : 'text-slate-300 hover:bg-slate-800'
-                    }`}
-                  >
-                    Run B: Distracted + Side Stimuli (45s)
-                  </button>
-                </div>
-              </div>
-            )}
-
-            <div className="flex flex-wrap items-center gap-2.5 sm:gap-3">
-              <button
-                type="button"
-                data-start="true"
-                onClick={() => startDrivingSession(appMode, trialType)}
-                className="px-6 sm:px-7 py-3 sm:py-3.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-base sm:text-lg tracking-wide transition-transform active:scale-95 cursor-pointer whitespace-nowrap"
-              >
-                {appMode === 'calibration'
-                  ? 'OPEN CALIBRATION & DRIVE'
-                  : appMode === 'demo'
-                  ? 'START DEMO DRIVE'
-                  : `START ${trialType.toUpperCase()} TRIAL`}
-              </button>
-
-              <button
-                type="button"
-                onClick={() => openSettingsOnTab('sidedisplays')}
-                className="px-4 py-3 sm:py-3.5 rounded-lg bg-slate-900/95 hover:bg-slate-800 text-slate-200 border border-slate-700 text-xs sm:text-sm font-medium transition-colors cursor-pointer whitespace-nowrap"
-              >
-                Connect Side Displays / QR
-              </button>
-            </div>
-          </div>
-
-          <div className="text-xs font-mono-tabular text-slate-300 tracking-wide">
-            WASD / Arrows Drive · Hold L (or Q/E) Look Away · V Side Stimulus · S
-            Settings · P Pause · R Restart
-          </div>
-        </div>
-      )}
-
-      {/* =====================================================================
-          STATE 2: GAME-NATIVE MINIMAL DRIVING HUD (>= 88% Clear Viewport)
-          ===================================================================== */}
-      {gameState === 'playing' && (
-        <div
-          onContextMenu={(e) => e.preventDefault()}
-          className="fixed inset-0 z-10 pointer-events-none flex flex-col justify-between p-3 sm:p-5 select-none touch-none"
-        >
-          {/* TOP PERIMETER: Compact Run Timer + Center Safety Alert + Top-Right Game Icons */}
-          <div className="flex items-start justify-between gap-3">
-            {/* Top-Left Compact Telemetry Pill with Biometric DriverGazeIcon */}
-            <div
-              className={`bg-[#090d16]/90 border ${highContrastBorder} rounded-xl px-3.5 py-2 flex items-center gap-3 pointer-events-auto shadow-2xl backdrop-blur-md`}
-            >
-              <div>
-                <div className="text-[10px] font-mono-tabular uppercase tracking-wider text-slate-400">
-                  {appMode === 'experiment'
-                    ? `TRIAL · ${hud.trialType.toUpperCase()}`
-                    : `MODE · ${appMode.toUpperCase()}`}
-                </div>
-                <div className="flex items-baseline gap-2">
-                  <span className="font-display font-bold text-lg sm:text-xl text-white font-mono-tabular">
-                    {appMode === 'experiment'
-                      ? `${Math.max(
-                          0,
-                          Math.ceil(
-                            EXPERIMENT_CONFIG.trialDurationSec -
-                              hud.trialElapsedSec,
-                          ),
-                        )}s`
-                      : `${hud.trialElapsedSec.toFixed(0)}s`}
-                  </span>
-                  <span className="text-xs font-mono-tabular text-slate-400">
-                    {hud.distanceMeters}m
-                  </span>
-                </div>
-              </div>
-
-              <div className="h-7 w-px bg-slate-800" />
-
-              <div
-                data-testid="attention-status-badge"
-                className={`px-2.5 py-1 rounded-lg border flex items-center gap-2 ${attentionBadgeStyle(
-                  hud.attention.state,
-                )}`}
-              >
-                <DriverGazeIcon
-                  className="w-5 h-5 shrink-0"
-                  active={hud.attention.state === 'ATTENTIVE'}
-                  alert={
-                    hud.attention.state === 'DISTRACTED' ||
-                    hud.attention.state === 'POSSIBLY_DISTRACTED'
-                  }
-                />
-                <div>
-                  <div className="text-[9px] font-mono-tabular uppercase tracking-wider opacity-85">
-                    GAZE ({hud.attention.mode === 'webcam' ? 'CAM' : 'SIM'})
-                  </div>
-                  <div className="text-xs font-display font-bold tracking-wide">
-                    {hud.attention.state}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Top-Center Conspicuous Non-Obstructive Safety Warning */}
-            <div className="flex-1 flex justify-center">
-              {(hud.attention.state === 'DISTRACTED' ||
-                hud.attention.state === 'POSSIBLY_DISTRACTED' ||
-                hud.isOutOfLane) && (
-                <div
-                  role="alert"
-                  data-testid="distraction-warning-banner"
-                  className={`px-4 py-1.5 rounded-xl border-2 shadow-xl flex items-center gap-2.5 ${
-                    hud.attention.state === 'DISTRACTED'
-                      ? 'bg-rose-950/95 border-rose-500 text-white'
-                      : 'bg-amber-950/95 border-amber-400 text-amber-100'
-                  }`}
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    className="w-5 h-5 shrink-0"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2.2"
-                  >
-                    <path d="M12 3L2 21h20L12 3z" />
-                    <path d="M12 10v5" />
-                    <circle cx="12" cy="18" r="1" fill="currentColor" />
-                  </svg>
-                  <div>
-                    <div className="font-display font-bold text-xs sm:text-sm tracking-wide uppercase">
-                      {hud.attention.state === 'DISTRACTED'
-                        ? 'EYES ON ROAD — SUSTAINED DISTRACTION DETECTED'
-                        : hud.attention.state === 'POSSIBLY_DISTRACTED'
-                        ? 'HEAD POSE DEVIATING FROM FORWARD ROAD'
-                        : 'LANE DEPARTURE — STEER BACK TO LANE'}
-                    </div>
-                    <div className="text-[11px] font-mono-tabular opacity-90">
-                      Off-Road: {(hud.attention.sustainedDeviationMs / 1000).toFixed(1)}s · Drift: {hud.laneDeviationMeters.toFixed(2)}m
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {/* Top-Right Compact In-Game Icon Bar */}
-            <div className="flex items-center gap-1.5 pointer-events-auto">
-              <button
-                type="button"
-                aria-label="Open Simulator Settings [S]"
-                tabIndex={-1}
-                onClick={(e) => {
-                  e.currentTarget.blur();
-                  openSettingsOnTab('display');
-                }}
-                className="h-9 px-2.5 rounded-lg bg-[#090d16]/85 border border-slate-700 hover:border-amber-400 text-slate-200 text-xs font-semibold flex items-center gap-1.5 cursor-pointer"
+                onClick={() => openSettingsOnTab('world')}
+                className="px-3.5 py-1.5 rounded-sm bg-[#060911]/90 hover:bg-slate-900 text-slate-200 border border-slate-700 hover:border-amber-400 text-xs font-mono-tabular font-semibold flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
               >
                 <svg
                   viewBox="0 0 24 24"
@@ -1171,422 +927,330 @@ function MainSimulatorApp({
                   <circle cx="12" cy="12" r="3" />
                   <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
                 </svg>
-                <span className="hidden sm:inline">Settings</span>
-              </button>
-
-              <button
-                type="button"
-                aria-label={
-                  audioSettings.muted ? 'Unmute Audio [M]' : 'Mute Audio [M]'
-                }
-                tabIndex={-1}
-                onClick={(e) => {
-                  e.currentTarget.blur();
-                  soundRef.current.toggleMute();
-                  setAudioSettings(soundRef.current.getSettings());
-                }}
-                className="w-9 h-9 rounded-lg bg-[#090d16]/85 border border-slate-700 hover:border-slate-500 flex items-center justify-center text-slate-200 cursor-pointer"
-              >
-                {audioSettings.muted ? (
-                  <svg
-                    viewBox="0 0 24 24"
-                    className="w-4 h-4"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                  >
-                    <path d="M11 5L6 9H2v6h4l5 4V5z" />
-                    <line x1="23" y1="9" x2="17" y2="15" />
-                    <line x1="17" y1="9" x2="23" y2="15" />
-                  </svg>
-                ) : (
-                  <svg
-                    viewBox="0 0 24 24"
-                    className="w-4 h-4"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                  >
-                    <path d="M11 5L6 9H2v6h4l5 4V5z" />
-                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
-                  </svg>
-                )}
-              </button>
-
-              <button
-                type="button"
-                aria-label="Restart Run [R]"
-                tabIndex={-1}
-                onClick={(e) => {
-                  e.currentTarget.blur();
-                  handleRestartRun();
-                }}
-                className="w-9 h-9 rounded-lg bg-[#090d16]/85 border border-slate-700 hover:border-slate-500 flex items-center justify-center text-slate-200 cursor-pointer"
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  className="w-4 h-4"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                >
-                  <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-                  <path d="M3 3v5h5" />
-                </svg>
-              </button>
-
-              <button
-                type="button"
-                aria-label="Pause Simulation [P]"
-                tabIndex={-1}
-                onClick={(e) => {
-                  e.currentTarget.blur();
-                  setGameState('paused');
-                  document.body.dataset.state = 'paused';
-                }}
-                className="w-9 h-9 rounded-lg bg-[#090d16]/85 border border-slate-700 hover:border-slate-500 flex items-center justify-center text-slate-200 cursor-pointer"
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  className="w-4 h-4"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                >
-                  <rect x="6" y="4" width="4" height="16" />
-                  <rect x="14" y="4" width="4" height="16" />
-                </svg>
+                <span>Settings &amp; Traffic [S]</span>
               </button>
             </div>
           </div>
 
-          {/* MIDDLE PERIMETER: Compact Collapsible Left & Right Side-Display Previews */}
-          {sideConfig.showEdgePreviews && (
-            <div className="my-auto flex items-center justify-between pointer-events-none">
-              {/* Left Side-Display Compact Preview */}
-              <div className="flex items-center pointer-events-auto">
-                {!leftPreviewCollapsed && (
-                  <div
-                    data-testid="left-display-preview"
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      inputAdapterRef.current?.setManualLookAway(
-                        hud.inputTelemetry.simulatingLookAwayLeft
-                          ? 'none'
-                          : 'left',
-                      );
-                    }}
-                    className={`w-20 p-2 rounded-r-xl bg-[#090d16]/85 border-y border-r ${
-                      hud.stimulus.activeSide === 'left'
-                        ? 'border-amber-400 shadow-lg'
-                        : 'border-slate-700/80'
-                    } flex flex-col items-center cursor-pointer`}
-                  >
-                    <div className="flex items-center justify-between w-full text-[9px] font-mono-tabular text-slate-400 mb-1">
-                      <span>L-DISP</span>
-                      <span
-                        className={
-                          networkTelemetry.left.status === 'connected'
-                            ? 'text-emerald-400'
-                            : 'text-slate-500'
-                        }
-                      >
-                        {networkTelemetry.left.status === 'connected'
-                          ? 'LINK'
-                          : 'LOC'}
-                      </span>
-                    </div>
-                    <SidePatternVisual
-                      active={hud.stimulus.activeSide === 'left'}
-                      pattern={sideConfig.leftPattern}
-                      intensity={sideConfig.leftIntensity}
-                      colorHex="#f59e0b"
-                      compact
-                    />
-                    <div className="text-[9px] font-mono-tabular text-slate-400 mt-1">
-                      [Q] Glance
-                    </div>
-                  </div>
-                )}
-                <button
-                  type="button"
-                  tabIndex={-1}
-                  aria-label={
-                    leftPreviewCollapsed
-                      ? 'Expand Left Display Preview'
-                      : 'Collapse Left Display Preview'
-                  }
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => setLeftPreviewCollapsed((c) => !c)}
-                  className="h-10 w-5 rounded-r bg-slate-900/90 border-y border-r border-slate-700 text-slate-400 hover:text-white text-xs flex items-center justify-center cursor-pointer"
-                >
-                  {leftPreviewCollapsed ? '›' : '‹'}
-                </button>
-              </div>
-
-              {/* Right Side-Display Compact Preview */}
-              <div className="flex items-center pointer-events-auto">
-                <button
-                  type="button"
-                  tabIndex={-1}
-                  aria-label={
-                    rightPreviewCollapsed
-                      ? 'Expand Right Display Preview'
-                      : 'Collapse Right Display Preview'
-                  }
-                  onMouseDown={(e) => e.preventDefault()}
-                  onClick={() => setRightPreviewCollapsed((c) => !c)}
-                  className="h-10 w-5 rounded-l bg-slate-900/90 border-y border-l border-slate-700 text-slate-400 hover:text-white text-xs flex items-center justify-center cursor-pointer"
-                >
-                  {rightPreviewCollapsed ? '‹' : '›'}
-                </button>
-                {!rightPreviewCollapsed && (
-                  <div
-                    data-testid="right-display-preview"
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      inputAdapterRef.current?.setManualLookAway(
-                        hud.inputTelemetry.simulatingLookAwayRight
-                          ? 'none'
-                          : 'right',
-                      );
-                    }}
-                    className={`w-20 p-2 rounded-l-xl bg-[#090d16]/85 border-y border-l ${
-                      hud.stimulus.activeSide === 'right'
-                        ? 'border-sky-400 shadow-lg'
-                        : 'border-slate-700/80'
-                    } flex flex-col items-center cursor-pointer`}
-                  >
-                    <div className="flex items-center justify-between w-full text-[9px] font-mono-tabular text-slate-400 mb-1">
-                      <span>R-DISP</span>
-                      <span
-                        className={
-                          networkTelemetry.right.status === 'connected'
-                            ? 'text-emerald-400'
-                            : 'text-slate-500'
-                        }
-                      >
-                        {networkTelemetry.right.status === 'connected'
-                          ? 'LINK'
-                          : 'LOC'}
-                      </span>
-                    </div>
-                    <SidePatternVisual
-                      active={hud.stimulus.activeSide === 'right'}
-                      pattern={sideConfig.rightPattern}
-                      intensity={sideConfig.rightIntensity}
-                      colorHex="#06b6d4"
-                      compact
-                    />
-                    <div className="text-[9px] font-mono-tabular text-slate-400 mt-1">
-                      [E] Glance
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* BOTTOM PERIMETER: High-End Automotive Cockpit Cluster & Forward Radar */}
-          <div
-            className={`flex items-end gap-2 sm:gap-3 mt-auto w-full max-w-full ${
-              showTouchControls
-                ? 'justify-center pb-24 sm:pb-0'
-                : 'justify-between'
-            }`}
-          >
-            {/* Bottom-Left Automotive Speed, Gear, Tachometer & Forward Radar Scope */}
-            <div
-              className={`bg-[#070b14]/94 border ${highContrastBorder} rounded-2xl p-2 sm:p-2.5 shadow-2xl pointer-events-auto flex items-center gap-2 sm:gap-3 backdrop-blur-md`}
+          {/* Left-Third Asymmetric Title Lockup & Native Telemetry Configurator */}
+          <div className="max-w-xl pointer-events-auto my-auto py-2">
+            <svg
+              viewBox="0 0 520 112"
+              className="w-full max-w-[430px] h-auto mb-2.5"
+              role="img"
+              aria-label="DISTRACT — Driver Attention & Road Safety Simulator"
             >
-              {/* Forward Traffic & Hazard Radar Scope (Desktop / Large Viewports) */}
-              <div className="hidden md:block">
-                <ForwardRadarScope
-                  hazards={hud.upcomingHazards}
-                  playerS={hud.distanceMeters}
-                  className="w-18 h-18 sm:w-20 sm:h-20"
-                />
+              <polygon points="24,12 62,12 44,94 6,94" fill="#f59e0b" />
+              <polygon points="72,12 98,12 80,94 54,94" fill="#38bdf8" />
+              <path d="M14 53 L94 53" stroke="#060911" strokeWidth="5" />
+              <text
+                x="114"
+                y="66"
+                fill="#f8fafc"
+                fontFamily="Chakra Petch, sans-serif"
+                fontWeight="700"
+                fontSize="64"
+                letterSpacing="4"
+              >
+                DISTRACT
+              </text>
+              <text
+                x="116"
+                y="93"
+                fill="#94a3b8"
+                fontFamily="IBM Plex Mono, monospace"
+                fontWeight="600"
+                fontSize="13"
+                letterSpacing="2.2"
+              >
+                DRIVER ATTENTION &amp; ROAD SAFETY LAB
+              </text>
+            </svg>
+
+            <p className="text-slate-300 text-xs sm:text-sm leading-relaxed mb-4 max-w-lg">
+              Experience how a two-second peripheral glance degrades lane
+              keeping, delays braking response, and escalates highway collision
+              risk.
+            </p>
+
+            {/* 1. Three Exhibition Modes Selector */}
+            <div
+              className="grid grid-cols-3 gap-2 mb-3"
+              role="group"
+              aria-label="Select Exhibition Mode"
+            >
+              <button
+                type="button"
+                onClick={() => {
+                  setAppMode('experiment');
+                  setTrialType('distracted');
+                }}
+                className={`p-2.5 rounded-sm border-l-2 border-y border-r text-left transition-colors cursor-pointer ${
+                  appMode === 'experiment'
+                    ? 'bg-slate-900/95 border-l-amber-400 border-amber-400/70 text-white'
+                    : 'bg-slate-950/85 border-slate-800 text-slate-400 hover:border-slate-600'
+                }`}
+              >
+                <div className="text-[10px] font-mono-tabular uppercase text-amber-400 font-semibold">
+                  01 · EXPERIMENT
+                </div>
+                <div className="text-xs sm:text-sm font-display font-bold mt-0.5 uppercase">
+                  Safety Trial
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setAppMode('demo')}
+                className={`p-2.5 rounded-sm border-l-2 border-y border-r text-left transition-colors cursor-pointer ${
+                  appMode === 'demo'
+                    ? 'bg-slate-900/95 border-l-sky-400 border-sky-400/70 text-white'
+                    : 'bg-slate-950/85 border-slate-800 text-slate-400 hover:border-slate-600'
+                }`}
+              >
+                <div className="text-[10px] font-mono-tabular uppercase text-sky-400 font-semibold">
+                  02 · FREE DRIVE
+                </div>
+                <div className="text-xs sm:text-sm font-display font-bold mt-0.5 uppercase">
+                  Open Highway
+                </div>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setAppMode('calibration')}
+                className={`p-2.5 rounded-sm border-l-2 border-y border-r text-left transition-colors cursor-pointer ${
+                  appMode === 'calibration'
+                    ? 'bg-slate-900/95 border-l-emerald-400 border-emerald-400/70 text-white'
+                    : 'bg-slate-950/85 border-slate-800 text-slate-400 hover:border-slate-600'
+                }`}
+              >
+                <div className="text-[10px] font-mono-tabular uppercase text-emerald-400 font-semibold">
+                  03 · HARDWARE
+                </div>
+                <div className="text-xs sm:text-sm font-display font-bold mt-0.5 uppercase">
+                  Wheel &amp; Gaze
+                </div>
+              </button>
+            </div>
+
+            {/* 2. Highway Route Map Selector & Traffic Control Strip */}
+            <div className="bg-[#060911]/92 border border-slate-800 rounded-sm p-2.5 mb-3 space-y-2.5">
+              <div className="flex items-center justify-between text-[10px] font-mono-tabular uppercase text-slate-400">
+                <span>HIGHWAY ROUTE MAP</span>
+                <span className="text-amber-400">
+                  {MAP_PRESETS[mapPreset].subtitle}
+                </span>
               </div>
-
-              {/* Digital Speedometer & MPH */}
-              <div>
-                <div className="flex items-center justify-between text-[10px] font-mono-tabular uppercase tracking-widest text-slate-400">
-                  <span>SPEED</span>
-                  <span className="text-slate-500 text-[9px]">
-                    {Math.round(hud.speedKmh * 0.621)} MPH
-                  </span>
-                </div>
-                <div className="flex items-baseline gap-1 my-0.5">
-                  <span
-                    data-testid="speed-readout"
-                    className="font-display font-bold text-2xl sm:text-4xl text-white font-mono-tabular leading-none hud-text-stroke tracking-tight"
-                  >
-                    {hud.speedKmh}
-                  </span>
-                  <span className="text-[10px] sm:text-[11px] font-mono-tabular text-amber-400 font-bold">
-                    KM/H
-                  </span>
-                </div>
-                <div className="text-[8px] sm:text-[9px] font-mono-tabular text-slate-400 flex items-center gap-1">
-                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                  <span>{hud.inputTelemetry.activeSource.toUpperCase()}</span>
-                </div>
-              </div>
-
-              <div className="h-10 sm:h-12 w-px bg-slate-800" />
-
-              {/* Drive Gear & Dynamic RPM Arc Bar */}
-              <div className="flex flex-col gap-1 w-20 sm:w-26">
-                <div className="flex items-center justify-between text-[9px] sm:text-[10px] font-mono-tabular">
-                  <span className="text-slate-400">GEAR</span>
-                  <span className="px-1.5 py-0.5 rounded bg-amber-500/20 border border-amber-400/40 text-amber-300 font-bold text-xs">
-                    D{hud.gear}
-                  </span>
-                </div>
-                {/* 3-Stage RPM Shift Lights: Normal (Cyan) -> Power (Amber) -> Redline (Crimson) */}
-                <div className="w-full h-1.5 sm:h-2 bg-slate-900 rounded-full border border-slate-700/80 overflow-hidden flex p-0.5">
-                  <div
-                    className={`h-full rounded-full transition-all duration-75 ${
-                      hud.rpmNormalized > 0.85
-                        ? 'bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.9)] animate-pulse'
-                        : hud.rpmNormalized > 0.6
-                        ? 'bg-amber-400'
-                        : 'bg-sky-400'
+              <div
+                className="grid grid-cols-2 sm:grid-cols-4 gap-1.5"
+                role="group"
+                aria-label="Select Highway Map"
+              >
+                {(Object.keys(MAP_PRESETS) as MapPreset[]).map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    data-testid={`title-map-${m}`}
+                    onClick={() => handleMapChange(m)}
+                    className={`py-1.5 px-2 rounded-sm border text-left font-mono-tabular text-xs cursor-pointer transition-colors ${
+                      mapPreset === m
+                        ? 'bg-amber-500/20 border-amber-400 text-white font-bold'
+                        : 'bg-slate-900/90 border-slate-800 text-slate-400 hover:border-slate-600'
                     }`}
-                    style={{
-                      width: `${Math.round(hud.rpmNormalized * 100)}%`,
-                    }}
-                  />
-                </div>
-                <div className="flex justify-between text-[8px] font-mono-tabular text-slate-400">
-                  <span>IDLE</span>
-                  <span
-                    className={
-                      hud.rpmNormalized > 0.85
-                        ? 'text-rose-400 font-bold'
-                        : 'text-slate-400'
-                    }
                   >
-                    {hud.rpmNormalized > 0.85 ? 'SHIFT!' : '8K RPM'}
-                  </span>
+                    <div className="text-[10px] uppercase tracking-wider">
+                      {MAP_PRESETS[m].shortLabel}
+                    </div>
+                  </button>
+                ))}
+              </div>
+
+              {/* Traffic Density & Camera View Quick Toggles */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-2 border-t border-slate-800/90">
+                <div>
+                  <div className="text-[9px] font-mono-tabular uppercase text-slate-400 mb-1">
+                    TRAFFIC DENSITY ({TRAFFIC_DENSITY_COUNTS[trafficConfig.density]} CARS)
+                  </div>
+                  <div className="grid grid-cols-4 gap-1">
+                    {(['none', 'light', 'normal', 'heavy'] as TrafficDensityPreset[]).map(
+                      (d) => (
+                        <button
+                          key={d}
+                          type="button"
+                          data-testid={`title-traffic-${d}`}
+                          onClick={() =>
+                            handleUpdateTrafficConfig({ density: d })
+                          }
+                          className={`py-1 rounded-sm text-[10px] font-mono-tabular uppercase border cursor-pointer ${
+                            trafficConfig.density === d
+                              ? 'bg-sky-500 text-slate-950 border-sky-400 font-bold'
+                              : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-600'
+                          }`}
+                        >
+                          {d === 'none' ? 'OFF' : d.toUpperCase()}
+                        </button>
+                      ),
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <div className="text-[9px] font-mono-tabular uppercase text-slate-400 mb-1">
+                    CAMERA PERSPECTIVE [C]
+                  </div>
+                  <div className="grid grid-cols-3 gap-1">
+                    {(['cockpit', 'chase', 'hood'] as CameraViewMode[]).map(
+                      (v) => (
+                        <button
+                          key={v}
+                          type="button"
+                          data-testid={`title-camera-${v}`}
+                          onClick={() => handleChangeCameraView(v)}
+                          className={`py-1 rounded-sm text-[10px] font-mono-tabular uppercase border cursor-pointer ${
+                            cameraView === v
+                              ? 'bg-amber-500 text-slate-950 border-amber-400 font-bold'
+                              : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-600'
+                          }`}
+                        >
+                          {v.toUpperCase()}
+                        </button>
+                      ),
+                    )}
+                  </div>
                 </div>
               </div>
             </div>
 
-            {/* Bottom-Right Highway Lane Drift Monitor & Action Buttons */}
-            <div
-              className={`bg-[#070b14]/94 border ${highContrastBorder} rounded-2xl p-2 sm:p-2.5 shadow-2xl pointer-events-auto flex items-center gap-2 sm:gap-3 backdrop-blur-md`}
-            >
-              {/* Graphic Lane Visualizer */}
-              <div className="hidden sm:flex flex-col items-center">
-                <div className="text-[9px] font-mono-tabular uppercase tracking-wider text-slate-400 mb-1">
-                  LANE
-                </div>
-                <div className="w-16 h-8 rounded bg-[#090d16] border border-slate-700 relative flex items-center justify-center overflow-hidden">
-                  {/* Left & Right Lane Boundaries */}
-                  <div className="absolute inset-y-0 left-1 w-0.5 bg-slate-500" />
-                  <div className="absolute inset-y-0 right-1 w-0.5 bg-slate-500" />
-                  {/* Dashed Center Stripe */}
-                  <div className="absolute inset-y-0 left-1/2 -translate-x-1/2 w-0.5 border-l border-dashed border-amber-400/60" />
-                  {/* Car Dot Position */}
-                  <div
-                    className={`w-2.5 h-3.5 rounded-sm border transition-all duration-75 ${
-                      hud.isOutOfLane
-                        ? 'bg-rose-500 border-white shadow-[0_0_8px_rgba(244,63,94,0.8)]'
-                        : 'bg-emerald-400 border-slate-900 shadow-[0_0_6px_rgba(52,211,153,0.8)]'
-                    }`}
-                    style={{
-                      transform: `translateX(${Math.max(
-                        -22,
-                        Math.min(22, (hud.lateralOffset - ROAD_CONFIG.playerDefaultLaneOffset) * 16),
-                      )}px)`,
-                    }}
-                  />
-                </div>
-              </div>
-
-              {/* Lane Drift Deviation Metric */}
-              <div>
-                <div className="text-[10px] font-mono-tabular uppercase tracking-widest text-slate-400">
-                  DRIFT
-                </div>
-                <div className="flex items-baseline gap-1 my-0.5">
-                  <span
-                    data-testid="lane-deviation-readout"
-                    className={`font-display font-bold text-2xl sm:text-3xl font-mono-tabular leading-none ${
-                      hud.isOutOfLane ? 'text-rose-400' : 'text-emerald-400'
-                    }`}
-                  >
-                    {hud.laneDeviationMeters.toFixed(2)}m
-                  </span>
-                  <span
-                    className={`text-[10px] font-mono-tabular font-bold ${
-                      hud.isOutOfLane ? 'text-rose-400' : 'text-emerald-400'
-                    }`}
-                  >
-                    {hud.isOutOfLane ? 'DEPART' : 'OK'}
-                  </span>
-                </div>
-                <div className="text-[9px] font-mono-tabular text-slate-400">
-                  TOLERANCE ±{ROAD_CONFIG.safeLaneTolerance}m
-                </div>
-              </div>
-
-              {!showTouchControls && (
-                <div className="hidden sm:flex gap-3 text-xs font-mono-tabular border-l border-slate-800 pl-3">
-                  <div>
-                    <div className="text-[9px] text-slate-400">HITS</div>
-                    <div className="text-sm font-bold text-white">
-                      {hud.collisionsCount}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-[9px] text-slate-400">GLANCES</div>
-                    <div className="text-sm font-bold text-amber-400">
-                      {hud.distractionCount}
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              <div className="flex items-center gap-2">
-                {!showTouchControls && (
+            {appMode === 'experiment' && (
+              <div className="flex flex-col sm:flex-row sm:items-center gap-2 mb-3 bg-[#060911]/92 border border-slate-800 p-2 rounded-sm">
+                <span className="text-[10px] font-mono-tabular uppercase text-slate-400 px-1 shrink-0">
+                  TRIAL PROTOCOL:
+                </span>
+                <div className="flex gap-1.5 flex-1">
                   <button
                     type="button"
-                    tabIndex={-1}
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      inputAdapterRef.current?.setManualLookAway(
-                        isLookAwayActive ? 'none' : 'left',
-                      );
-                    }}
-                    className={`h-9 px-3 rounded-xl text-xs font-display font-bold flex items-center gap-1.5 cursor-pointer whitespace-nowrap transition-all shadow-md ${
-                      isLookAwayActive
-                        ? 'bg-rose-600 text-white shadow-[0_0_15px_rgba(244,63,94,0.6)] animate-pulse'
-                        : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-600'
+                    onClick={() => setTrialType('baseline')}
+                    className={`flex-1 py-1.5 px-2.5 rounded-sm text-xs font-mono-tabular font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                      trialType === 'baseline'
+                        ? 'bg-emerald-500 text-slate-950 font-bold'
+                        : 'text-slate-300 bg-slate-900 hover:bg-slate-800'
                     }`}
                   >
-                    <DriverGazeIcon
-                      className="w-4 h-4"
-                      active={!isLookAwayActive}
-                      alert={isLookAwayActive}
-                    />
-                    <span>{isLookAwayActive ? 'Look Forward' : 'Look Away [L]'}</span>
+                    RUN A: BASELINE (45s)
                   </button>
-                )}
-
-                <button
-                  type="button"
-                  tabIndex={-1}
-                  onClick={finishCurrentTrialAndShowResults}
-                  className="h-9 px-3.5 rounded-xl bg-gradient-to-r from-amber-500 to-amber-400 hover:from-amber-400 hover:to-amber-300 text-slate-950 font-display font-bold text-xs cursor-pointer whitespace-nowrap shadow-md active:scale-95 transition-transform flex items-center gap-1"
-                >
-                  <span>Results [F]</span>
-                </button>
+                  <button
+                    type="button"
+                    onClick={() => setTrialType('distracted')}
+                    className={`flex-1 py-1.5 px-2.5 rounded-sm text-xs font-mono-tabular font-semibold transition-colors cursor-pointer whitespace-nowrap ${
+                      trialType === 'distracted'
+                        ? 'bg-amber-500 text-slate-950 font-bold'
+                        : 'text-slate-300 bg-slate-900 hover:bg-slate-800'
+                    }`}
+                  >
+                    RUN B: DISTRACTED (45s)
+                  </button>
+                </div>
               </div>
+            )}
+
+            <div className="flex flex-wrap items-center gap-2.5">
+              <button
+                type="button"
+                data-start="true"
+                onClick={() => startDrivingSession(appMode, trialType)}
+                className="px-6 py-3 rounded-sm bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-base sm:text-lg uppercase tracking-wider transition-transform active:scale-95 cursor-pointer whitespace-nowrap"
+              >
+                {appMode === 'calibration'
+                  ? 'OPEN CALIBRATION & DRIVE'
+                  : appMode === 'demo'
+                  ? 'START FREE DRIVE'
+                  : `LAUNCH ${trialType.toUpperCase()} TRIAL`}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => openSettingsOnTab('sidedisplays')}
+                className="px-4 py-3 rounded-sm bg-[#060911]/95 hover:bg-slate-900 text-slate-200 border border-slate-700 text-xs font-mono-tabular uppercase tracking-wider transition-colors cursor-pointer whitespace-nowrap"
+              >
+                Side Displays &amp; QR
+              </button>
             </div>
           </div>
+
+          <div className="text-[11px] font-mono-tabular text-slate-400 tracking-wider uppercase">
+            [WASD / Arrows] Drive · [C] Camera View · [L / Q / E] Glance Away ·
+            [V] Side Pulse · [S] Map &amp; Traffic Settings
+          </div>
         </div>
+      )}
+
+      {/* =====================================================================
+          STATE 2: NATIVE MOTORSPORT TELEMETRY HUD (>= 88% Clear 3D Viewport)
+          ===================================================================== */}
+      {gameState === 'playing' && (
+        <AutomotiveHud
+          speedKmh={hud.speedKmh}
+          gear={hud.gear}
+          rpmNormalized={hud.rpmNormalized}
+          lateralAccelG={hud.lateralAccelG}
+          longitudinalAccelG={hud.longitudinalAccelG}
+          distanceMeters={hud.distanceMeters}
+          laneDeviationMeters={hud.laneDeviationMeters}
+          lateralOffset={hud.lateralOffset}
+          isOutOfLane={hud.isOutOfLane}
+          isOnShoulder={hud.isOnShoulder}
+          attention={hud.attention}
+          trialElapsedSec={hud.trialElapsedSec}
+          trialType={hud.trialType}
+          appMode={appMode}
+          mapPreset={mapPreset}
+          cameraView={cameraView}
+          trafficConfig={trafficConfig}
+          collisionsCount={hud.collisionsCount}
+          distractionCount={hud.distractionCount}
+          stimulus={hud.stimulus}
+          sideConfig={sideConfig}
+          networkTelemetry={networkTelemetry}
+          leftPreviewCollapsed={leftPreviewCollapsed}
+          rightPreviewCollapsed={rightPreviewCollapsed}
+          onToggleLeftPreview={() => setLeftPreviewCollapsed((c) => !c)}
+          onToggleRightPreview={() => setRightPreviewCollapsed((c) => !c)}
+          onGlanceSide={(side) => {
+            if (side === 'left') {
+              inputAdapterRef.current?.setManualLookAway(
+                hud.inputTelemetry.simulatingLookAwayLeft ? 'none' : 'left',
+              );
+            } else {
+              inputAdapterRef.current?.setManualLookAway(
+                hud.inputTelemetry.simulatingLookAwayRight ? 'none' : 'right',
+              );
+            }
+          }}
+          upcomingHazards={hud.upcomingHazards}
+          inputTelemetry={hud.inputTelemetry}
+          audioMuted={audioSettings.muted}
+          isLookAwayActive={isLookAwayActive}
+          highContrast={accessibilitySettings.highContrastHud}
+          showTouchControls={showTouchControls}
+          webcamTracker={webcamTrackerRef.current}
+          onToggleWebcam={() => handleToggleWebcamMode(!webcamActive)}
+          onToggleSimulatedEyes={handleToggleSimulatedEyes}
+          isSimulatedClosed={isSimulatedClosed}
+          onOpenSettings={() => openSettingsOnTab('world')}
+          onCycleCameraView={handleCycleCameraView}
+          onToggleMute={() => {
+            soundRef.current.toggleMute();
+            setAudioSettings(soundRef.current.getSettings());
+          }}
+          onRestartRun={handleRestartRun}
+          onTogglePause={() => {
+            setGameState('paused');
+            document.body.dataset.state = 'paused';
+          }}
+          onToggleLookAway={handleToggleSimulatedEyes}
+          onFinishTrial={finishCurrentTrialAndShowResults}
+        />
       )}
 
       {/* Multi-Touch On-Screen Steering & Pedals Overlay for Mobile / Tablet */}
@@ -1598,12 +1262,18 @@ function MainSimulatorApp({
       )}
 
       {/* =====================================================================
-          DEDICATED IN-GAME SETTINGS & CONNECTION MODAL
+          DEDICATED IN-GAME SETTINGS, MAP & TRAFFIC MODAL
           ===================================================================== */}
       {showSettingsModal && (
         <SettingsModal
           initialTab={settingsTab}
           onClose={() => setShowSettingsModal(false)}
+          mapPreset={mapPreset}
+          onChangeMap={handleMapChange}
+          trafficConfig={trafficConfig}
+          onUpdateTrafficConfig={handleUpdateTrafficConfig}
+          cameraView={cameraView}
+          onChangeCameraView={handleChangeCameraView}
           qualityPreset={qualityPreset}
           onChangeQuality={handleQualityChange}
           lightingPreset={lightingPreset}
@@ -1645,17 +1315,17 @@ function MainSimulatorApp({
         <div
           role="dialog"
           aria-label="Simulation Paused"
-          className="fixed inset-0 z-30 bg-[#090d16]/85 flex items-center justify-center p-4"
+          className="fixed inset-0 z-30 bg-[#060911]/85 flex items-center justify-center p-4"
         >
-          <div className="w-full max-w-md bg-[#0f172a] border border-slate-700 rounded-xl p-6 shadow-2xl">
+          <div className="w-full max-w-md bg-[#0a0f1d] border border-slate-700 rounded-sm p-6 shadow-2xl">
             <div className="text-xs font-mono-tabular uppercase tracking-widest text-amber-400">
-              SIMULATION PAUSED
+              SIMULATION PAUSED · {MAP_PRESETS[mapPreset].shortLabel}
             </div>
-            <h2 className="text-2xl font-display font-bold text-white mt-1 mb-4">
+            <h2 className="text-2xl font-display font-bold text-white mt-1 mb-4 uppercase">
               Session Paused
             </h2>
 
-            <div className="grid grid-cols-3 gap-2.5 mb-6 bg-slate-950 p-3 rounded-lg border border-slate-800 font-mono-tabular">
+            <div className="grid grid-cols-3 gap-2.5 mb-6 bg-slate-950 p-3 rounded-sm border border-slate-800 font-mono-tabular">
               <div>
                 <div className="text-[10px] text-slate-400">DISTANCE</div>
                 <div className="text-lg font-bold text-white">
@@ -1676,35 +1346,35 @@ function MainSimulatorApp({
               </div>
             </div>
 
-            <div className="flex flex-col gap-2.5">
+            <div className="flex flex-col gap-2">
               <button
                 type="button"
                 onClick={() => {
                   setGameState('playing');
                   document.body.dataset.state = 'playing';
                 }}
-                className="w-full py-3 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-base cursor-pointer"
+                className="w-full py-3 rounded-sm bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-base uppercase tracking-wider cursor-pointer"
               >
                 Resume Driving
               </button>
               <button
                 type="button"
-                onClick={() => openSettingsOnTab('display')}
-                className="w-full py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-100 font-semibold text-sm cursor-pointer"
+                onClick={() => openSettingsOnTab('world')}
+                className="w-full py-2.5 rounded-sm bg-slate-800 hover:bg-slate-700 text-slate-100 font-mono-tabular font-semibold text-xs uppercase tracking-wider cursor-pointer"
               >
-                Settings &amp; Side Displays
+                Change Map, Traffic &amp; Settings
               </button>
               <button
                 type="button"
                 onClick={handleRestartRun}
-                className="w-full py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-100 font-semibold text-sm cursor-pointer"
+                className="w-full py-2.5 rounded-sm bg-slate-800 hover:bg-slate-700 text-slate-100 font-mono-tabular font-semibold text-xs uppercase tracking-wider cursor-pointer"
               >
                 Restart Current Trial
               </button>
               <button
                 type="button"
                 onClick={finishCurrentTrialAndShowResults}
-                className="w-full py-2.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-300 font-semibold text-sm cursor-pointer"
+                className="w-full py-2.5 rounded-sm bg-slate-800 hover:bg-slate-700 text-amber-300 font-mono-tabular font-semibold text-xs uppercase tracking-wider cursor-pointer"
               >
                 End Run &amp; Compare Results
               </button>
@@ -1714,7 +1384,7 @@ function MainSimulatorApp({
                   setGameState('title');
                   document.body.dataset.state = 'title';
                 }}
-                className="w-full py-2.5 rounded-lg bg-slate-900 hover:bg-slate-800 text-slate-400 text-sm cursor-pointer"
+                className="w-full py-2.5 rounded-sm bg-slate-900 hover:bg-slate-800 text-slate-400 font-mono-tabular text-xs uppercase tracking-wider cursor-pointer"
               >
                 Return to Title Screen
               </button>
@@ -1730,15 +1400,15 @@ function MainSimulatorApp({
         <div
           role="dialog"
           aria-label="Experiment Results Summary"
-          className="fixed inset-0 z-30 bg-[#090d16]/90 flex items-center justify-center p-4 overflow-y-auto"
+          className="fixed inset-0 z-30 bg-[#060911]/90 flex items-center justify-center p-4 overflow-y-auto"
         >
-          <div className="w-full max-w-3xl bg-[#0f172a] border border-slate-700 rounded-xl p-6 md:p-8 shadow-2xl my-auto">
+          <div className="w-full max-w-3xl bg-[#0a0f1d] border border-slate-700 rounded-sm p-6 md:p-8 shadow-2xl my-auto">
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-4 mb-5">
               <div>
                 <div className="text-xs font-mono-tabular uppercase tracking-widest text-amber-400">
-                  EXHIBITION TELEMETRY REPORT · OBJECTIVE SESSION SUMMARY
+                  TELEMETRY REPORT · {MAP_PRESETS[mapPreset].label.toUpperCase()}
                 </div>
-                <h2 className="text-2xl md:text-3xl font-display font-bold text-white mt-0.5">
+                <h2 className="text-2xl md:text-3xl font-display font-bold text-white mt-0.5 uppercase">
                   Attentive Baseline vs. Distracted Driving
                 </h2>
               </div>
@@ -1750,7 +1420,7 @@ function MainSimulatorApp({
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
-              <div className="bg-slate-950 border border-slate-800 rounded-lg p-4">
+              <div className="bg-slate-950 border border-slate-800 rounded-sm p-4">
                 <div className="flex items-center justify-between mb-3">
                   <span className="text-xs font-mono-tabular uppercase text-emerald-400 font-semibold">
                     RUN A · ATTENTIVE BASELINE
@@ -1798,7 +1468,7 @@ function MainSimulatorApp({
                 </div>
               </div>
 
-              <div className="bg-slate-950 border border-amber-500/50 rounded-lg p-4">
+              <div className="bg-slate-950 border border-amber-500/50 rounded-sm p-4">
                 <div className="flex items-center justify-between mb-3">
                   <span className="text-xs font-mono-tabular uppercase text-amber-400 font-semibold">
                     {distractedData && distractedData.trialType === 'distracted'
@@ -1852,7 +1522,7 @@ function MainSimulatorApp({
               </div>
             </div>
 
-            <div className="bg-slate-900/90 border border-slate-800 rounded-lg p-3.5 mb-6 text-xs text-slate-300 leading-relaxed">
+            <div className="bg-slate-900/90 border border-slate-800 rounded-sm p-3.5 mb-6 text-xs text-slate-300 leading-relaxed">
               <strong className="text-white">
                 Exhibition Observation Note:
               </strong>{' '}
@@ -1870,14 +1540,14 @@ function MainSimulatorApp({
                   onClick={() =>
                     startDrivingSession('experiment', 'distracted')
                   }
-                  className="px-5 py-3 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-sm cursor-pointer whitespace-nowrap"
+                  className="px-5 py-3 rounded-sm bg-amber-500 hover:bg-amber-400 text-slate-950 font-display font-bold text-sm uppercase tracking-wider cursor-pointer whitespace-nowrap"
                 >
                   Run Distracted Trial (45s)
                 </button>
                 <button
                   type="button"
                   onClick={() => startDrivingSession('experiment', 'baseline')}
-                  className="px-5 py-3 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-display font-bold text-sm cursor-pointer whitespace-nowrap"
+                  className="px-5 py-3 rounded-sm bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-display font-bold text-sm uppercase tracking-wider cursor-pointer whitespace-nowrap"
                 >
                   Run Attentive Baseline (45s)
                 </button>
@@ -1889,7 +1559,7 @@ function MainSimulatorApp({
                   setGameState('title');
                   document.body.dataset.state = 'title';
                 }}
-                className="px-4 py-3 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium cursor-pointer whitespace-nowrap"
+                className="px-4 py-3 rounded-sm bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-mono-tabular uppercase tracking-wider cursor-pointer whitespace-nowrap"
               >
                 Return to Title
               </button>

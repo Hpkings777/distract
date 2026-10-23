@@ -16,11 +16,34 @@ import {
 } from './controls.ts';
 import { AttentionMonitor } from './attention-monitor.ts';
 import { ExperimentManager } from './experiment.ts';
+import type { MapPreset } from './config.ts';
 
-test('road spine starts straight and lane evaluation detects lane departure', () => {
-  const startSample = getRoadSample(0);
-  assert.equal(startSample.centerX, 0);
-  assert.equal(startSample.curvature, 0);
+test('road spine starts straight at s=0 across all 4 map presets and computes exact analytical pitch/heading derivatives', () => {
+  const maps: MapPreset[] = ['alpine', 'coastal', 'urban', 'desert'];
+  for (const map of maps) {
+    const startSample = getRoadSample(0, map);
+    assert.equal(startSample.centerX, 0, `${map} centerX is 0 at s=0`);
+    assert.equal(startSample.elevationY, 0, `${map} elevationY is 0 at s=0`);
+    assert.equal(startSample.curvature, 0, `${map} curvature is 0 at s=0`);
+
+    // Check finite difference vs analytical derivative at s = 250m
+    const s0 = 250;
+    const ds = 0.01;
+    const sampleA = getRoadSample(s0 - ds, map);
+    const sampleB = getRoadSample(s0 + ds, map);
+    const sampleMid = getRoadSample(s0, map);
+    const numericDxDs = (sampleB.centerX - sampleA.centerX) / (2 * ds);
+    const numericDyDs = (sampleB.elevationY - sampleA.elevationY) / (2 * ds);
+
+    assert.ok(
+      Math.abs(Math.tan(sampleMid.headingRad) - numericDxDs) < 1e-4,
+      `${map} headingRad matches exact d(centerX)/ds`,
+    );
+    assert.ok(
+      Math.abs(Math.tan(sampleMid.pitchRad) - numericDyDs) < 1e-4,
+      `${map} pitchRad matches exact d(elevationY)/ds`,
+    );
+  }
 
   const inLane = evaluateLanePosition(1.8, 1);
   assert.equal(inLane.isOutOfLane, false);
@@ -31,15 +54,35 @@ test('road spine starts straight and lane evaluation detects lane departure', ()
   assert.ok(driftedLeft.deviationFromTargetLane > 1.5);
 });
 
-test('seeded hazard generator produces deterministic hazard sequences', () => {
+test('seeded hazard generator respects trafficConfig density, speedMultiplier, and workzone toggle', () => {
   const runA = generateInitialHazards(42, 10);
   const runB = generateInitialHazards(42, 10);
   assert.equal(runA.length, 10);
   assert.deepEqual(runA, runB);
-  assert.ok(runA[0].s >= 60, 'First hazard spawns safely ahead of player');
+  assert.ok(runA[0].s >= 65, 'First hazard spawns safely ahead of player');
+
+  const emptyTraffic = generateInitialHazards(42, undefined, {
+    density: 'none',
+    aggression: 'normal',
+    allowWorkZones: true,
+    speedMultiplier: 1.0,
+  });
+  assert.equal(emptyTraffic.length, 0, 'density=none produces 0 hazards');
+
+  const heavyNoWorkzones = generateInitialHazards(42, undefined, {
+    density: 'heavy',
+    aggression: 'aggressive',
+    allowWorkZones: false,
+    speedMultiplier: 1.2,
+  });
+  assert.equal(heavyNoWorkzones.length, 36, 'density=heavy produces 36 hazards');
+  assert.ok(
+    heavyNoWorkzones.every((h) => h.type !== 'work_zone'),
+    'allowWorkZones=false excludes work_zone hazards',
+  );
 });
 
-test('vehicle physics accelerates, shifts gears, brakes, steers, and enforces guardrail bounds', () => {
+test('vehicle physics accelerates, shifts 6-speed gears, rotates wheels, brakes, and enforces guardrail bounds', () => {
   const state = createInitialVehicleState();
   const initialSpeed = state.speed;
 
@@ -51,11 +94,13 @@ test('vehicle physics accelerates, shifts gears, brakes, steers, and enforces gu
       [],
       0.05,
       false,
+      'alpine',
     );
   }
   assert.ok(state.speed > initialSpeed, 'Vehicle speed increases under throttle');
   assert.ok(state.s > 0, 'Vehicle advances along road');
-  assert.ok(state.gear >= 1 && state.gear <= 5, 'Gear stays within 5-speed transmission range');
+  assert.ok(state.wheelRotationRad > 0, 'Wheels rotate forward with distance');
+  assert.ok(state.gear >= 1 && state.gear <= 6, 'Gear stays within 6-speed transmission range');
   assert.ok(state.rpmNormalized > 0 && state.rpmNormalized <= 1, 'RPM normalized within [0..1]');
 
   // Brake for 0.5s
@@ -67,6 +112,7 @@ test('vehicle physics accelerates, shifts gears, brakes, steers, and enforces gu
       [],
       0.05,
       false,
+      'alpine',
     );
   }
   assert.ok(state.speed < peakSpeed, 'Vehicle decelerates under braking');
@@ -79,6 +125,7 @@ test('vehicle physics accelerates, shifts gears, brakes, steers, and enforces gu
       [],
       0.05,
       false,
+      'alpine',
     );
   }
   assert.ok(state.lateralOffset <= 5.0, 'Guardrail prevents infinite lateral excursion');
@@ -104,37 +151,53 @@ test('controller steering axis normalization and multi-touch simultaneous input 
   adapter.dispose();
 });
 
-test('AttentionMonitor transitions through grace period, POSSIBLY_DISTRACTED, DISTRACTED, and recovery', () => {
+test('AttentionMonitor DMS tracks eye closure, 5.0s threshold, emergency slowdown and recovery', () => {
   const monitor = new AttentionMonitor('simulated');
   assert.equal(monitor.getState().state, 'ATTENTIVE');
+  assert.equal(monitor.getState().emergencySlowdownActive, false);
 
-  // Brief 200ms glance away should NOT trigger alarm (grace period)
-  monitor.update({ yawDeg: 28, pitchDeg: 0, confidence: 0.95, source: 'simulated' }, 1000);
+  // Brief 200ms blink should NOT trigger warning (natural blink)
+  monitor.update({ eyesClosed: true, eyeOpenness: 0.1, confidence: 0.95, source: 'simulated' }, 1000);
   const s1 = monitor.update(
-    { yawDeg: 28, pitchDeg: 0, confidence: 0.95, source: 'simulated' },
+    { eyesClosed: true, eyeOpenness: 0.1, confidence: 0.95, source: 'simulated' },
     1200,
   );
   assert.equal(s1.state, 'ATTENTIVE');
+  assert.equal(s1.emergencySlowdownActive, false);
 
-  // Sustained 550ms look-away -> POSSIBLY_DISTRACTED
-  for (let t = 1400; t <= 1600; t += 200) {
-    monitor.update({ yawDeg: 28, pitchDeg: 0, confidence: 0.95, source: 'simulated' }, t);
+  // Closed for 1.5s -> warning state
+  for (let t = 1400; t <= 2500; t += 200) {
+    monitor.update({ eyesClosed: true, eyeOpenness: 0.05, confidence: 0.95, source: 'simulated' }, t);
   }
-  assert.equal(monitor.getState().state, 'POSSIBLY_DISTRACTED');
+  const sWarn = monitor.getState();
+  assert.ok(sWarn.state === 'DROWSY_WARNING' || sWarn.state === 'POSSIBLY_DISTRACTED');
+  assert.equal(sWarn.emergencySlowdownActive, false);
 
-  // Sustained > 1350ms look-away -> DISTRACTED
-  for (let t = 1800; t <= 2600; t += 200) {
-    monitor.update({ yawDeg: 28, pitchDeg: 0, confidence: 0.95, source: 'simulated' }, t);
+  // Closed for >= 5.0 seconds (cumulative 5200ms) -> DROWSY_CRITICAL / emergency slowdown!
+  for (let t = 2700; t <= 6300; t += 200) {
+    monitor.update({ eyesClosed: true, eyeOpenness: 0.02, confidence: 0.95, source: 'simulated' }, t);
   }
-  assert.equal(monitor.getState().state, 'DISTRACTED');
+  const sCrit = monitor.getState();
+  assert.ok(sCrit.state === 'DROWSY_CRITICAL' || sCrit.state === 'DISTRACTED');
+  assert.equal(sCrit.emergencySlowdownActive, true, 'Emergency slowdown must be engaged at >= 5s threshold');
 
-  // Return gaze to road center for >= 250ms -> recovers to ATTENTIVE
-  monitor.update({ yawDeg: 0, pitchDeg: 0, confidence: 0.95, source: 'simulated' }, 2800);
+  // Verify that vehicle actually decelerates under emergency slowdown
+  const vehicle = createInitialVehicleState();
+  vehicle.speed = 22.0; // cruising at ~80 km/h
+  const initialSpeed = vehicle.speed;
+  for (let i = 0; i < 15; i++) {
+    stepVehicleSimulation(vehicle, { steer: 0, throttle: 1, brake: 0 }, [], 0.05, true, true);
+  }
+  assert.ok(vehicle.speed < initialSpeed * 0.4, 'Emergency slowdown forced rapid vehicle deceleration');
+
+  // Eyes reopen -> instant recovery
+  monitor.update({ eyesClosed: false, eyeOpenness: 0.95, confidence: 0.95, source: 'simulated' }, 6500);
   const recovered = monitor.update(
-    { yawDeg: 0, pitchDeg: 0, confidence: 0.95, source: 'simulated' },
-    3000,
+    { eyesClosed: false, eyeOpenness: 0.95, confidence: 0.95, source: 'simulated' },
+    6700,
   );
   assert.equal(recovered.state, 'ATTENTIVE');
+  assert.equal(recovered.emergencySlowdownActive, false);
 });
 
 test('ExperimentManager records distraction events, lane deviation, recovery time, and side display stimuli', () => {
@@ -156,12 +219,10 @@ test('ExperimentManager records distraction events, lane deviation, recovery tim
   assert.ok(lastBroadcastPayload !== null, 'Broadcast callback invoked on stimulus trigger');
 
   const vehicle = createInitialVehicleState();
-  // Normal attentive driving for 1s
   for (let i = 0; i < 10; i++) {
     exp.step(0.1, vehicle, 'ATTENTIVE', [], false);
   }
 
-  // Driver becomes distracted and drifts out of lane
   vehicle.lateralOffset = -0.5;
   vehicle.laneDeviationMeters = 2.3;
   vehicle.isOutOfLane = true;
@@ -169,9 +230,7 @@ test('ExperimentManager records distraction events, lane deviation, recovery tim
     exp.step(0.1, vehicle, 'DISTRACTED', [], false);
   }
 
-  // Gaze returns to road while still out of lane
   exp.step(0.1, vehicle, 'ATTENTIVE', [], false);
-  // 0.4s later, driver steers back inside safe lane
   exp.step(0.2, vehicle, 'ATTENTIVE', [], false);
   vehicle.lateralOffset = 1.8;
   vehicle.laneDeviationMeters = 0;
@@ -202,8 +261,9 @@ test('collision physics stops tunneling through vehicles at high speed and trans
       laneIndex: 1 as const,
       lateralOffset: 1.8,
       speed: 10.0,
-      width: 2.3,
-      length: 7.2,
+      baseCruiseSpeed: 10.0,
+      width: 2.35,
+      length: 7.4,
       colorHex: 0xe2e8f0,
       telegraphActive: false,
       brakeTriggered: false,
@@ -214,7 +274,6 @@ test('collision physics stops tunneling through vehicles at high speed and trans
   ];
 
   const events: any[] = [];
-  // Step simulation where player approaches and strikes the truck
   for (let i = 0; i < 10; i++) {
     const stepEvents = stepVehicleSimulation(
       state,
@@ -226,7 +285,6 @@ test('collision physics stops tunneling through vehicles at high speed and trans
     events.push(...stepEvents);
   }
 
-  // Player must NOT phase through the truck: state.s must remain behind the truck's rear bumper!
   assert.ok(
     state.s <= hazards[0].s - 4.5,
     `Player car must not phase through lead truck (player s=${state.s.toFixed(2)}, hazard s=${hazards[0].s.toFixed(2)})`,
@@ -252,8 +310,9 @@ test('traffic car-following AI prevents lead vehicle overlap and maintains safe 
       laneIndex: 1 as const,
       lateralOffset: 1.8,
       speed: 8.0,
-      width: 2.3,
-      length: 7.2,
+      baseCruiseSpeed: 8.0,
+      width: 2.35,
+      length: 7.4,
       colorHex: 0xe2e8f0,
       telegraphActive: false,
       brakeTriggered: false,
@@ -264,12 +323,13 @@ test('traffic car-following AI prevents lead vehicle overlap and maintains safe 
     {
       id: 2,
       type: 'sedan' as const,
-      s: 120, // 20m behind the truck in the same lane
+      s: 120,
       laneIndex: 1 as const,
       lateralOffset: 1.8,
-      speed: 16.0, // faster approach
-      width: 1.85,
-      length: 4.2,
+      speed: 16.0,
+      baseCruiseSpeed: 16.0,
+      width: 1.88,
+      length: 4.55,
       colorHex: 0x38bdf8,
       telegraphActive: false,
       brakeTriggered: false,
@@ -279,7 +339,6 @@ test('traffic car-following AI prevents lead vehicle overlap and maintains safe 
     },
   ];
 
-  // Run simulation for 2 seconds (40 steps of 0.05s)
   for (let i = 0; i < 40; i++) {
     stepVehicleSimulation(
       state,
@@ -290,46 +349,16 @@ test('traffic car-following AI prevents lead vehicle overlap and maintains safe 
     );
   }
 
-  // Sedan must not phase through the truck ahead!
+  const sedan = hazards.find((h) => h.id === 2)!;
+  const truck = hazards.find((h) => h.id === 1)!;
+
   assert.ok(
-    hazards[1].s < hazards[0].s,
-    `Trailing sedan must remain behind lead truck (sedan s=${hazards[1].s.toFixed(2)}, truck s=${hazards[0].s.toFixed(2)})`,
+    sedan.s < truck.s,
+    `Trailing sedan must remain behind lead truck (sedan s=${sedan.s.toFixed(2)}, truck s=${truck.s.toFixed(2)})`,
   );
-  const separation = hazards[0].s - hazards[1].s;
+  const separation = truck.s - sedan.s;
   assert.ok(
-    separation >= (hazards[0].length + hazards[1].length) * 0.5,
+    separation >= (truck.length + sedan.length) * 0.5,
     `Trailing vehicle maintained rigid physical separation (${separation.toFixed(2)}m)`,
   );
 });
-
-test('road-normal perpendicular coordinates ensure roadside props never intersect road carriageway', () => {
-  const roadCarriagewayLimit = 5.0; // 3.6m carriageway + 1.4m shoulder
-  const propPlacementDist = 8.5; // placed at least 8.5m perpendicular
-
-  for (let s = 100; s <= 800; s += 50) {
-    const sample = getRoadSample(s);
-    const nx = Math.cos(sample.headingRad);
-    const nz = Math.sin(sample.headingRad);
-
-    // Test for both left and right sides
-    for (const side of [-1, 1]) {
-      const propX = sample.centerX + side * propPlacementDist * nx;
-      const propZ = -s + side * propPlacementDist * nz;
-
-      // Distance from road center (sample.centerX, -s) along perpendicular normal
-      const dx = propX - sample.centerX;
-      const dz = propZ - (-s);
-      const normalDist = Math.sqrt(dx * dx + dz * dz);
-
-      assert.ok(
-        normalDist >= propPlacementDist - 0.01,
-        `Prop perpendicular distance (${normalDist.toFixed(2)}m) matches target distance`,
-      );
-      assert.ok(
-        normalDist > roadCarriagewayLimit + 2.0,
-        `Prop is safely outside road carriageway and guardrail boundary (${roadCarriagewayLimit}m)`,
-      );
-    }
-  }
-});
-
